@@ -329,7 +329,7 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vpss.stVpssChnAttr[0].enChnMode = VPSS_CHN_MODE_USER;
     app->vpss.stVpssChnAttr[0].enCompressMode = COMPRESS_MODE_NONE;
     app->vpss.stVpssChnAttr[0].enDynamicRange = DYNAMIC_RANGE_SDR8;
-    app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_YUV420SP;
+    app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_RGB888;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32SrcFrameRate = -1;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32DstFrameRate = -1;
     app->vpss.stVpssChnAttr[0].u32Width = VIDEO_W;

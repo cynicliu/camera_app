@@ -185,6 +185,9 @@ static void *framebuffer_preview_loop(void *opaque) {
         return NULL;
     }
 
+    /* Remove the boot framebuffer before the first camera frame arrives. */
+    memset(fb, 0, map_len);
+
     while (!app->quit && !g_signal_stop) {
         VIDEO_FRAME_INFO_S frame;
         uint8_t *src;

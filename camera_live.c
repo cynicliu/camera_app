@@ -63,6 +63,7 @@ typedef struct {
     pthread_mutex_t muxer_lock;
     bool running;
     bool audio_enabled;
+    bool framebuffer_preview;
     bool quit;
     bool isp_ready;
     bool mpi_ready;
@@ -95,10 +96,67 @@ static int g_touch_max_y = SCREEN_H - 1;
 static bool g_touch_down;
 static lv_disp_draw_buf_t g_lv_draw_buf;
 static lv_color_t g_lv_pixels[SCREEN_W * 20];
+static int g_lv_fb_fd = -1;
+static uint8_t *g_lv_fb;
+static size_t g_lv_fb_len;
+static struct fb_fix_screeninfo g_lv_fb_fix;
 
 static void signal_handler(int sig) {
     (void)sig;
     g_signal_stop = 1;
+}
+
+static bool lvgl_framebuffer_open(void) {
+    struct fb_var_screeninfo var;
+
+    if (g_lv_fb) return true;
+    g_lv_fb_fd = open("/dev/fb0", O_RDWR);
+    if (g_lv_fb_fd < 0 ||
+        ioctl(g_lv_fb_fd, FBIOGET_FSCREENINFO, &g_lv_fb_fix) ||
+        ioctl(g_lv_fb_fd, FBIOGET_VSCREENINFO, &var) ||
+        var.bits_per_pixel != 32) {
+        if (g_lv_fb_fd >= 0) close(g_lv_fb_fd);
+        g_lv_fb_fd = -1;
+        return false;
+    }
+    g_lv_fb_len = g_lv_fb_fix.smem_len;
+    g_lv_fb = mmap(NULL, g_lv_fb_len, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, g_lv_fb_fd, 0);
+    if (g_lv_fb == MAP_FAILED) {
+        g_lv_fb = NULL;
+        close(g_lv_fb_fd);
+        g_lv_fb_fd = -1;
+        return false;
+    }
+    return true;
+}
+
+static void lvgl_framebuffer_flush(lv_disp_drv_t *drv, const lv_area_t *area,
+                                   lv_color_t *colors) {
+    int x, y;
+
+    if (lvgl_framebuffer_open()) {
+        for (y = area->y1; y <= area->y2; ++y) {
+            uint8_t *dst = g_lv_fb + (size_t)(BAR_Y + y) * g_lv_fb_fix.line_length +
+                           (size_t)area->x1 * 4;
+            for (x = area->x1; x <= area->x2; ++x) {
+                lv_color_t color = *colors++;
+                dst[0] = (uint8_t)(color.ch.blue * 255 / 31);
+                dst[1] = (uint8_t)(color.ch.green * 255 / 63);
+                dst[2] = (uint8_t)(color.ch.red * 255 / 31);
+                dst += 4;
+            }
+        }
+    }
+    lv_disp_flush_ready(drv);
+}
+
+static void lvgl_framebuffer_close(void) {
+    if (g_lv_fb) munmap(g_lv_fb, g_lv_fb_len);
+    if (g_lv_fb_fd >= 0) close(g_lv_fb_fd);
+    g_lv_fb = NULL;
+    g_lv_fb_fd = -1;
+    g_lv_fb_len = 0;
 }
 
 static uint8_t clamp_u8(int value) {
@@ -131,6 +189,7 @@ static void *framebuffer_preview_loop(void *opaque) {
         VIDEO_FRAME_INFO_S frame;
         uint8_t *src;
         uint32_t x, y, stride;
+        bool display_frame;
         RK_S32 ret = RK_MPI_VI_GetChnFrame(0, 1, &frame, 200);
         if (ret != RK_SUCCESS) {
             if (++failures % 10 == 0)
@@ -145,17 +204,22 @@ static void *framebuffer_preview_loop(void *opaque) {
         }
         src = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
         stride = frame.stVFrame.u32VirWidth;
-        for (y = 0; y < VIDEO_H; ++y) {
-            uint32_t *dst = (uint32_t *)(fb + (size_t)(VIDEO_Y + y) * fix.line_length);
-            for (x = 0; x < VIDEO_W; ++x) {
-                int yy = src[y * stride + x];
-                uint8_t *uv = src + stride * frame.stVFrame.u32VirHeight +
-                              (y / 2) * stride + (x & ~1U);
-                int uu = uv[0] - 128, vv = uv[1] - 128;
-                int c = yy - 16;
-                dst[x] = (uint32_t)(clamp_u8((298 * c + 409 * vv + 128) >> 8) << 16) |
-                         (uint32_t)(clamp_u8((298 * c - 100 * uu - 208 * vv + 128) >> 8) << 8) |
-                         clamp_u8((298 * c + 516 * uu + 128) >> 8);
+        pthread_mutex_lock(&app->lock);
+        display_frame = app->running;
+        pthread_mutex_unlock(&app->lock);
+        if (display_frame) {
+            for (y = 0; y < VIDEO_H; ++y) {
+                uint32_t *dst = (uint32_t *)(fb + (size_t)(VIDEO_Y + y) * fix.line_length);
+                for (x = 0; x < VIDEO_W; ++x) {
+                    int yy = src[y * stride + x];
+                    uint8_t *uv = src + stride * frame.stVFrame.u32VirHeight +
+                                  (y / 2) * stride + (x & ~1U);
+                    int uu = uv[0] - 128, vv = uv[1] - 128;
+                    int c = yy - 16;
+                    dst[x] = (uint32_t)(clamp_u8((298 * c + 409 * vv + 128) >> 8) << 16) |
+                             (uint32_t)(clamp_u8((298 * c - 100 * uu - 208 * vv + 128) >> 8) << 8) |
+                             clamp_u8((298 * c + 516 * uu + 128) >> 8);
+                }
             }
         }
         RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
@@ -198,11 +262,12 @@ static void lvgl_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 
 static RK_S32 set_video_visible(APP_CTX *app, bool visible) {
     RK_S32 ret = RK_SUCCESS;
+    return RK_SUCCESS;
     if (visible && !app->video_bound) {
-        ret = SAMPLE_COMM_Bind(&app->vi_src, &app->vo_dst);
+        ret = SAMPLE_COMM_Bind(&app->vpss_src, &app->vo_dst);
         if (ret == RK_SUCCESS) app->video_bound = true;
     } else if (!visible && app->video_bound) {
-        ret = SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
+        ret = SAMPLE_COMM_UnBind(&app->vpss_src, &app->vo_dst);
         if (ret == RK_SUCCESS) app->video_bound = false;
     }
     return ret;
@@ -388,37 +453,41 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vi.stChnAttr.stFrameRate.s32DstFrameRate = -1;
     if (SAMPLE_COMM_VI_CreateChn(&app->vi) != RK_SUCCESS) return RK_FAILURE;
     app->vi_ready = true;
-    return RK_SUCCESS;
+    if (app->framebuffer_preview || !app->vo_ready) return RK_SUCCESS;
 
     memset(&app->vpss, 0, sizeof(app->vpss));
     app->vpss.s32GrpId = 0; app->vpss.s32ChnId = 0;
     app->vpss.enVProcDevType = VIDEO_PROC_DEV_RGA;
     app->vpss.stGrpVpssAttr.enPixelFormat = RK_FMT_YUV420SP;
     app->vpss.stGrpVpssAttr.enCompressMode = COMPRESS_MODE_NONE;
+    app->vpss.s32ChnRotation[0] = ROTATION_0;
     app->vpss.stGrpVpssAttr.u32MaxW = VIDEO_W;
     app->vpss.stGrpVpssAttr.u32MaxH = VIDEO_H;
     app->vpss.stVpssChnAttr[0].enChnMode = VPSS_CHN_MODE_USER;
     app->vpss.stVpssChnAttr[0].enCompressMode = COMPRESS_MODE_NONE;
     app->vpss.stVpssChnAttr[0].enDynamicRange = DYNAMIC_RANGE_SDR8;
-    app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_YUV420SP;
+    app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_RGB888;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32SrcFrameRate = -1;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32DstFrameRate = -1;
     app->vpss.stVpssChnAttr[0].u32Width = VIDEO_W;
     app->vpss.stVpssChnAttr[0].u32Height = VIDEO_H;
-    if (RK_SUCCESS != RK_SUCCESS) return RK_FAILURE;
-    app->vpss_ready = false;
+    if (SAMPLE_COMM_VPSS_CreateChn(&app->vpss) != RK_SUCCESS) return RK_FAILURE;
+    app->vpss_ready = true;
 
     memset(&app->vo, 0, sizeof(app->vo));
     app->vo.s32DevId = 0; app->vo.s32LayerId = 0; app->vo.s32ChnId = 0;
-    app->vo.Volayer_mode = VO_LAYER_MODE_VIDEO; app->vo.u32DispBufLen = 3;
-    app->vo.stVoPubAttr.enIntfType = VO_INTF_DEFAULT;
+    app->vo.Volayer_mode = VO_LAYER_MODE_GRAPHIC; app->vo.u32DispBufLen = 3;
+    app->vo.stVoPubAttr.enIntfType = VO_INTF_MIPI;
     app->vo.stVoPubAttr.enIntfSync = VO_OUTPUT_DEFAULT;
+    app->vo.stLayerAttr.stDispRect.s32X = 0;
+    app->vo.stLayerAttr.stDispRect.s32Y = 0;
     app->vo.stLayerAttr.stDispRect.u32Width = SCREEN_W;
     app->vo.stLayerAttr.stDispRect.u32Height = SCREEN_H;
     app->vo.stLayerAttr.stImageSize.u32Width = SCREEN_W;
     app->vo.stLayerAttr.stImageSize.u32Height = SCREEN_H;
     app->vo.stLayerAttr.u32DispFrmRt = 30;
     app->vo.stLayerAttr.enPixFormat = RK_FMT_RGB888;
+    app->vo.stChnAttr.stRect.s32X = 0;
     app->vo.stChnAttr.stRect.s32Y = VIDEO_Y;
     app->vo.stChnAttr.stRect.u32Width = VIDEO_W;
     app->vo.stChnAttr.stRect.u32Height = VIDEO_H;
@@ -449,7 +518,7 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vpss_dst = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
     app->vpss_src = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
     app->vo_dst = (MPP_CHN_S){RK_ID_VO, 0, 0};
-    if (SAMPLE_COMM_Bind(&app->vi_src, &app->vo_dst) != RK_SUCCESS)
+    if (SAMPLE_COMM_Bind(&app->vi_src, &app->vpss_dst) != RK_SUCCESS)
         return RK_FAILURE;
     if (set_video_visible(app, true) != RK_SUCCESS) return RK_FAILURE;
     return RK_SUCCESS;
@@ -540,7 +609,7 @@ static void init_lvgl(APP_CTX *app) {
     lv_disp_drv_init(&display_driver);
     display_driver.hor_res = SCREEN_W;
     display_driver.ver_res = BAR_H;
-    display_driver.flush_cb = lvgl_flush;
+    display_driver.flush_cb = lvgl_framebuffer_flush;
     display_driver.draw_buf = &g_lv_draw_buf;
     lv_disp_drv_register(&display_driver);
 
@@ -570,6 +639,7 @@ static void event_loop(APP_CTX *app) {
     uint64_t previous_ms = 0;
     struct timespec now;
     g_touch_fd = open_touchscreen();
+    if (!app->framebuffer_preview) init_lvgl(app);
 
     printf("Controls: touch bottom bar, or type p (play/pause), m (mute), q (quit).\n");
     fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
@@ -585,9 +655,10 @@ static void event_loop(APP_CTX *app) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         current_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
         if (previous_ms == 0) previous_ms = current_ms;
-        lv_tick_inc((uint32_t)(current_ms - previous_ms));
+        if (!app->framebuffer_preview)
+            lv_tick_inc((uint32_t)(current_ms - previous_ms));
         previous_ms = current_ms;
-        lv_timer_handler();
+        if (!app->framebuffer_preview) lv_timer_handler();
         usleep(5000);
     }
     if (g_touch_fd >= 0) close(g_touch_fd);
@@ -596,6 +667,7 @@ static void event_loop(APP_CTX *app) {
 
 static void cleanup(APP_CTX *app) {
     app->quit = true;
+    lvgl_framebuffer_close();
     if (app->preview_thread_ready) pthread_join(app->preview_thread, NULL);
     if (app->audio_thread_ready) pthread_join(app->audio_thread, NULL);
     if (app->stream_callbacks_ready) media_callbacks_stop(&app->stream_callbacks);
@@ -604,7 +676,7 @@ static void cleanup(APP_CTX *app) {
     if (app->aenc_ready) SAMPLE_COMM_AENC_DestroyChn(&app->aenc);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
     if (app->video_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
-    if (app->vpss_ready) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
+    if (app->vpss_ready) SAMPLE_COMM_UnBind(&app->vi_src, &app->vpss_dst);
     if (app->ui_mb) RK_MPI_MB_ReleaseMB(app->ui_mb);
     if (app->ui_ready) RK_MPI_VO_DisableChn(0, UI_CHN);
     if (app->vo_ready) SAMPLE_COMM_VO_DestroyChn(&app->vo);
@@ -622,10 +694,13 @@ int main(int argc, char **argv) {
     APP_CTX app;
     const char *iq_dir = argc > 1 ? argv[1] : "/etc/iqfiles";
     const char *rtmp_url = argc > 2 ? argv[2] : NULL;
+    const bool framebuffer_preview = argc > 3 &&
+        strcmp(argv[3], "--framebuffer") == 0;
     memset(&app, 0, sizeof(app));
     pthread_mutex_init(&app.lock, NULL);
     pthread_mutex_init(&app.muxer_lock, NULL);
     app.running = true; app.audio_enabled = true;
+    app.framebuffer_preview = framebuffer_preview;
     signal(SIGINT, signal_handler); signal(SIGTERM, signal_handler);
 
     if (SAMPLE_COMM_ISP_Init(0, RK_AIQ_WORKING_MODE_NORMAL, RK_FALSE, iq_dir)

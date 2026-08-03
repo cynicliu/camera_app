@@ -18,8 +18,10 @@ static void button_event(lv_event_t *event) {
         if (ui->callbacks.set_audio_enabled)
             ui->callbacks.set_audio_enabled(ui->callbacks.userdata,
                                             ui->audio_enabled);
-    } else if (ui->callbacks.request_exit) {
-        ui->callbacks.request_exit(ui->callbacks.userdata);
+    } else if (ui->running) {
+        camera_ui_set_running(ui, false);
+        if (ui->callbacks.set_running)
+            ui->callbacks.set_running(ui->callbacks.userdata, false);
     }
 }
 

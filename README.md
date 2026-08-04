@@ -70,6 +70,17 @@ chmod +x /userdata/camera_live
 /userdata/camera_live /etc/iqfiles
 ```
 
+The framebuffer preview reads frames from VI by default. Select VPSS when the
+preview should use its RGB888 output instead:
+
+```sh
+/userdata/camera_live /etc/iqfiles --lvgl --frame-source=vi
+/userdata/camera_live /etc/iqfiles --lvgl --frame-source=vpss
+```
+
+VPSS mode binds VI channel 1 to VPSS group 0/channel 0 and does not create or
+bind a VO channel.
+
 To keep the local preview and publish H.265 video plus AAC audio at the same
 time, pass the RTMP destination as the second argument:
 

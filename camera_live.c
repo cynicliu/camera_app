@@ -43,6 +43,11 @@
 #define AUDIO_BITRATE 32000
 #define MUXER_ID 0
 
+typedef enum {
+    FRAME_SOURCE_VI,
+    FRAME_SOURCE_VPSS,
+} FRAME_SOURCE_E;
+
 typedef struct {
     SAMPLE_VI_CTX_S vi;
     SAMPLE_VPSS_CTX_S vpss;
@@ -63,7 +68,8 @@ typedef struct {
     pthread_mutex_t muxer_lock;
     bool running;
     bool audio_enabled;
-    bool framebuffer_preview;
+    bool lvgl_preview;
+    FRAME_SOURCE_E frame_source;
     bool quit;
     bool isp_ready;
     bool mpi_ready;
@@ -193,16 +199,26 @@ static void *framebuffer_preview_loop(void *opaque) {
         uint8_t *src;
         uint32_t x, y, stride;
         bool display_frame;
-        RK_S32 ret = RK_MPI_VI_GetChnFrame(0, 1, &frame, 200);
+        RK_S32 ret;
+
+        if (app->frame_source == FRAME_SOURCE_VPSS)
+            ret = RK_MPI_VPSS_GetChnFrame(app->vpss.s32GrpId,
+                                          app->vpss.s32ChnId, &frame, 200);
+        else
+            ret = RK_MPI_VI_GetChnFrame(app->vi.s32DevId,
+                                        app->vi.s32ChnId, &frame, 200);
         if (ret != RK_SUCCESS) {
             if (++failures % 10 == 0)
-                fprintf(stderr, "framebuffer preview: VI get frame failed: %#x\n", ret);
+                fprintf(stderr, "framebuffer preview: %s get frame failed: %#x\n",
+                        app->frame_source == FRAME_SOURCE_VPSS ? "VPSS" : "VI",
+                        ret);
             continue;
         }
         if (!logged_frame) {
-            fprintf(stderr, "framebuffer preview: frame %ux%u stride=%u\n",
+            fprintf(stderr, "framebuffer preview: source=%s frame=%ux%u stride=%u format=%d\n",
+                    app->frame_source == FRAME_SOURCE_VPSS ? "VPSS" : "VI",
                     frame.stVFrame.u32Width, frame.stVFrame.u32Height,
-                    frame.stVFrame.u32VirWidth);
+                    frame.stVFrame.u32VirWidth, frame.stVFrame.enPixelFormat);
             logged_frame = true;
         }
         src = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
@@ -211,6 +227,41 @@ static void *framebuffer_preview_loop(void *opaque) {
         display_frame = app->running;
         pthread_mutex_unlock(&app->lock);
         if (display_frame) {
+            if (app->frame_source == FRAME_SOURCE_VPSS) {
+                for (y = 0; y < VIDEO_H; ++y) {
+                    const uint8_t *src_row = src +
+                        (size_t)y * frame.stVFrame.u32VirWidth * 3;
+                    uint32_t *dst = (uint32_t *)(fb +
+                        (size_t)(VIDEO_Y + y) * fix.line_length);
+                    for (x = 0; x < VIDEO_W; ++x) {
+                        const uint8_t *rgb = src_row + (size_t)x * 3;
+                        dst[x] = ((uint32_t)rgb[0] << 16) |
+                                 ((uint32_t)rgb[1] << 8) | rgb[2];
+                    }
+                }
+            } else {
+            /*
+            
+                Y Y Y Y ... (Y平面，高度=frame_height)
+                Y Y Y Y ...
+                ...
+                UV UV UV UV ... (UV平面，高度=frame_height/2)
+                UV UV UV UV ...
+
+                src + stride * frame.stVFrame.u32VirHeight：跳到UV平面起始
+
+                (y / 2) * stride：每2个Y行共享1个UV行
+
+                (x & ~1U)：每2个X像素共享1个UV值（对齐到偶数）
+
+                ~1U = 0xFFFFFFFE，确保x是偶数
+
+                // 系数放大256倍，避免浮点运算
+                R = (298 * c + 409 * vv + 128) >> 8
+                G = (298 * c - 100 * uu - 208 * vv + 128) >> 8
+                B = (298 * c + 516 * uu + 128) >> 8
+            
+            */
             for (y = 0; y < VIDEO_H; ++y) {
                 uint32_t *dst = (uint32_t *)(fb + (size_t)(VIDEO_Y + y) * fix.line_length);
                 for (x = 0; x < VIDEO_W; ++x) {
@@ -224,8 +275,14 @@ static void *framebuffer_preview_loop(void *opaque) {
                              clamp_u8((298 * c + 516 * uu + 128) >> 8);
                 }
             }
+            }
         }
-        RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
+        if (app->frame_source == FRAME_SOURCE_VPSS)
+            RK_MPI_VPSS_ReleaseChnFrame(app->vpss.s32GrpId,
+                                        app->vpss.s32ChnId, &frame);
+        else
+            RK_MPI_VI_ReleaseChnFrame(app->vi.s32DevId,
+                                      app->vi.s32ChnId, &frame);
     }
     munmap(fb, map_len);
     close(fb_fd);
@@ -442,8 +499,6 @@ static RK_S32 init_streaming(APP_CTX *app, const char *rtmp_url) {
 }
 
 static RK_S32 init_video(APP_CTX *app) {
-    VO_CHN_ATTR_S ui_attr;
-
     memset(&app->vi, 0, sizeof(app->vi));
     app->vi.u32Width = VIDEO_W; app->vi.u32Height = VIDEO_H;
     app->vi.s32DevId = 0; app->vi.u32PipeId = 0; app->vi.s32ChnId = 1;
@@ -456,7 +511,8 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vi.stChnAttr.stFrameRate.s32DstFrameRate = -1;
     if (SAMPLE_COMM_VI_CreateChn(&app->vi) != RK_SUCCESS) return RK_FAILURE;
     app->vi_ready = true;
-    if (app->framebuffer_preview || !app->vo_ready) return RK_SUCCESS;
+    app->vi_src = (MPP_CHN_S){RK_ID_VI, 0, app->vi.s32ChnId};
+    if (app->frame_source == FRAME_SOURCE_VI) return RK_SUCCESS;
 
     memset(&app->vpss, 0, sizeof(app->vpss));
     app->vpss.s32GrpId = 0; app->vpss.s32ChnId = 0;
@@ -476,54 +532,10 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vpss.stVpssChnAttr[0].u32Height = VIDEO_H;
     if (SAMPLE_COMM_VPSS_CreateChn(&app->vpss) != RK_SUCCESS) return RK_FAILURE;
     app->vpss_ready = true;
-
-    memset(&app->vo, 0, sizeof(app->vo));
-    app->vo.s32DevId = 0; app->vo.s32LayerId = 0; app->vo.s32ChnId = 0;
-    app->vo.Volayer_mode = VO_LAYER_MODE_GRAPHIC; app->vo.u32DispBufLen = 3;
-    app->vo.stVoPubAttr.enIntfType = VO_INTF_MIPI;
-    app->vo.stVoPubAttr.enIntfSync = VO_OUTPUT_DEFAULT;
-    app->vo.stLayerAttr.stDispRect.s32X = 0;
-    app->vo.stLayerAttr.stDispRect.s32Y = 0;
-    app->vo.stLayerAttr.stDispRect.u32Width = SCREEN_W;
-    app->vo.stLayerAttr.stDispRect.u32Height = SCREEN_H;
-    app->vo.stLayerAttr.stImageSize.u32Width = SCREEN_W;
-    app->vo.stLayerAttr.stImageSize.u32Height = SCREEN_H;
-    app->vo.stLayerAttr.u32DispFrmRt = 30;
-    app->vo.stLayerAttr.enPixFormat = RK_FMT_RGB888;
-    app->vo.stChnAttr.stRect.s32X = 0;
-    app->vo.stChnAttr.stRect.s32Y = VIDEO_Y;
-    app->vo.stChnAttr.stRect.u32Width = VIDEO_W;
-    app->vo.stChnAttr.stRect.u32Height = VIDEO_H;
-    app->vo.stChnAttr.u32Priority = 1;
-    if (SAMPLE_COMM_VO_CreateChn(&app->vo) != RK_SUCCESS) return RK_FAILURE;
-    app->vo_ready = true;
-
-    memset(&ui_attr, 0, sizeof(ui_attr));
-    ui_attr.stRect.s32Y = BAR_Y; ui_attr.stRect.u32Width = SCREEN_W;
-    ui_attr.stRect.u32Height = BAR_H; ui_attr.u32FgAlpha = 255;
-    ui_attr.u32Priority = 2;
-    if (RK_MPI_VO_SetChnAttr(0, UI_CHN, &ui_attr) != RK_SUCCESS ||
-        RK_MPI_VO_EnableChn(0, UI_CHN) != RK_SUCCESS) return RK_FAILURE;
-    app->ui_ready = true;
-
-    memset(&app->ui_frame, 0, sizeof(app->ui_frame));
-    if (RK_MPI_SYS_MmzAlloc(&app->ui_mb, NULL, NULL, SCREEN_W * BAR_H * 3)
-        != RK_SUCCESS) return RK_FAILURE;
-    app->ui_frame.stVFrame.pMbBlk = app->ui_mb;
-    app->ui_frame.stVFrame.u32Width = SCREEN_W;
-    app->ui_frame.stVFrame.u32Height = BAR_H;
-    app->ui_frame.stVFrame.u32VirWidth = SCREEN_W;
-    app->ui_frame.stVFrame.u32VirHeight = BAR_H;
-    app->ui_frame.stVFrame.enPixelFormat = RK_FMT_RGB888;
-    app->ui_frame.stVFrame.enCompressMode = COMPRESS_MODE_NONE;
-
-    app->vi_src = (MPP_CHN_S){RK_ID_VI, 0, 1};
     app->vpss_dst = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
     app->vpss_src = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
-    app->vo_dst = (MPP_CHN_S){RK_ID_VO, 0, 0};
     if (SAMPLE_COMM_Bind(&app->vi_src, &app->vpss_dst) != RK_SUCCESS)
         return RK_FAILURE;
-    if (set_video_visible(app, true) != RK_SUCCESS) return RK_FAILURE;
     return RK_SUCCESS;
 }
 
@@ -642,7 +654,7 @@ static void event_loop(APP_CTX *app) {
     uint64_t previous_ms = 0;
     struct timespec now;
     g_touch_fd = open_touchscreen();
-    if (!app->framebuffer_preview) init_lvgl(app);
+    if (!app->lvgl_preview) init_lvgl(app);
 
     printf("Controls: touch bottom bar, or type p (play/pause), m (mute), q (quit).\n");
     fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
@@ -658,10 +670,10 @@ static void event_loop(APP_CTX *app) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         current_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
         if (previous_ms == 0) previous_ms = current_ms;
-        if (!app->framebuffer_preview)
+        if (!app->lvgl_preview)
             lv_tick_inc((uint32_t)(current_ms - previous_ms));
         previous_ms = current_ms;
-        if (!app->framebuffer_preview) lv_timer_handler();
+        if (!app->lvgl_preview) lv_timer_handler();
         usleep(5000);
     }
     if (g_touch_fd >= 0) close(g_touch_fd);
@@ -693,17 +705,65 @@ static void cleanup(APP_CTX *app) {
     pthread_mutex_destroy(&app->lock);
 }
 
+static void print_usage(const char *program) {
+    fprintf(stderr,
+            "Usage: %s [iq_dir] [rtmp_url] [--lvgl] "
+            "[--frame-source=vi|vpss]\n", program);
+}
+
+/*
+ * ./camera_live /etc/iqfiles --lvgl --frame-source=vi
+ * ./camera_live /etc/iqfiles --lvgl --frame-source=vpss
+*/
 int main(int argc, char **argv) {
     APP_CTX app;
-    const char *iq_dir = argc > 1 ? argv[1] : "/etc/iqfiles";
-    const char *rtmp_url = argc > 2 ? argv[2] : NULL;
-    const bool framebuffer_preview = argc > 3 &&
-        strcmp(argv[3], "--framebuffer") == 0;
+    const char *iq_dir = "/etc/iqfiles";
+    const char *rtmp_url = NULL;
+    bool lvgl_preview = false;
+    FRAME_SOURCE_E frame_source = FRAME_SOURCE_VI;
+    int positional = 0;
+    int i;
+
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--lvgl") == 0) {
+            lvgl_preview = true;
+        } else if (strncmp(argv[i], "--frame-source=", 15) == 0) {
+            const char *value = argv[i] + 15;
+            if (strcmp(value, "vi") == 0)
+                frame_source = FRAME_SOURCE_VI;
+            else if (strcmp(value, "vpss") == 0)
+                frame_source = FRAME_SOURCE_VPSS;
+            else {
+                fprintf(stderr, "Invalid frame source: %s\n", value);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--help") == 0 ||
+                   strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 2;
+        } else if (positional++ == 0) {
+            iq_dir = argv[i];
+        } else if (positional == 2) {
+            rtmp_url = argv[i];
+        } else {
+            fprintf(stderr, "Too many positional arguments\n");
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
     memset(&app, 0, sizeof(app));
     pthread_mutex_init(&app.lock, NULL);
     pthread_mutex_init(&app.muxer_lock, NULL);
     app.running = true; app.audio_enabled = true;
-    app.framebuffer_preview = framebuffer_preview;
+    app.lvgl_preview = lvgl_preview;
+    app.frame_source = frame_source;
+    printf("Frame source: %s\n",
+           frame_source == FRAME_SOURCE_VPSS ? "VPSS" : "VI");
     signal(SIGINT, signal_handler); signal(SIGTERM, signal_handler);
 
     if (SAMPLE_COMM_ISP_Init(0, RK_AIQ_WORKING_MODE_NORMAL, RK_FALSE, iq_dir)

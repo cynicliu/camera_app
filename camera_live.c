@@ -504,6 +504,7 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vi.s32DevId = 0; app->vi.u32PipeId = 0; app->vi.s32ChnId = 1;
     app->vi.stChnAttr.stIspOpt.u32BufCount = 3;
     app->vi.stChnAttr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
+    // 增加了 VPSS 通道的 u32Depth = 1，使应用可通过 RK_MPI_VPSS_GetChnFrame() 获取帧
     app->vi.stChnAttr.u32Depth = 1;
     app->vi.stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
     app->vi.stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
@@ -528,6 +529,7 @@ static RK_S32 init_video(APP_CTX *app) {
     app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_RGB888;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32SrcFrameRate = -1;
     app->vpss.stVpssChnAttr[0].stFrameRate.s32DstFrameRate = -1;
+    app->vpss.stVpssChnAttr[0].u32Depth = 1;
     app->vpss.stVpssChnAttr[0].u32Width = VIDEO_W;
     app->vpss.stVpssChnAttr[0].u32Height = VIDEO_H;
     if (SAMPLE_COMM_VPSS_CreateChn(&app->vpss) != RK_SUCCESS) return RK_FAILURE;

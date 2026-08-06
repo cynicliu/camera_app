@@ -656,7 +656,7 @@ static void event_loop(APP_CTX *app) {
     uint64_t previous_ms = 0;
     struct timespec now;
     g_touch_fd = open_touchscreen();
-    if (!app->lvgl_preview) init_lvgl(app);
+    if (app->lvgl_preview) init_lvgl(app);
 
     printf("Controls: touch bottom bar, or type p (play/pause), m (mute), q (quit).\n");
     fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
@@ -672,10 +672,10 @@ static void event_loop(APP_CTX *app) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         current_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
         if (previous_ms == 0) previous_ms = current_ms;
-        if (!app->lvgl_preview)
+        if (app->lvgl_preview)
             lv_tick_inc((uint32_t)(current_ms - previous_ms));
         previous_ms = current_ms;
-        if (!app->lvgl_preview) lv_timer_handler();
+        if (app->lvgl_preview) lv_timer_handler();
         usleep(5000);
     }
     if (g_touch_fd >= 0) close(g_touch_fd);

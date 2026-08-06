@@ -24,7 +24,9 @@
 #include "rk_mpi_vo.h"
 #include "rk_mpi_venc.h"
 #include "rkmuxer.h"
+#include "rtsp_demo.h"
 #include "lvgl/lvgl.h"
+#include "camera_config.h"
 #include "camera_ui.h"
 #include "media_callbacks.h"
 
@@ -42,6 +44,8 @@
 #define VIDEO_BITRATE_KBPS 2048
 #define AUDIO_BITRATE 32000
 #define MUXER_ID 0
+#define VPSS_PREVIEW_CHN 0
+#define VPSS_STREAM_CHN 1
 
 typedef enum {
     FRAME_SOURCE_VI,
@@ -59,13 +63,17 @@ typedef struct {
     MPP_CHN_S vi_src;
     MPP_CHN_S vpss_dst;
     MPP_CHN_S vpss_src;
+    MPP_CHN_S vpss_stream_src;
     MPP_CHN_S vo_dst;
+    MPP_CHN_S venc_src;
     MPP_CHN_S venc_dst;
     pthread_t audio_thread;
     pthread_t preview_thread;
     media_callbacks_t stream_callbacks;
     pthread_mutex_t lock;
     pthread_mutex_t muxer_lock;
+    rtsp_demo_handle rtsp_demo;
+    rtsp_session_handle rtsp_session;
     bool running;
     bool audio_enabled;
     bool lvgl_preview;
@@ -85,6 +93,7 @@ typedef struct {
     bool aenc_ready;
     bool venc_bound;
     bool muxer_ready;
+    bool rtsp_ready;
     bool stream_callbacks_ready;
     bool video_bound;
     MB_BLK ui_mb;
@@ -366,20 +375,29 @@ static bool is_h265_keyframe(const VENC_PACK_S *pack) {
            pack->DataType.enH265EType == H265E_NALU_IDRSLICE;
 }
 
-static void rtmp_video_callback(const VENC_STREAM_S *stream, void *userdata) {
+static void streaming_video_callback(const VENC_STREAM_S *stream, void *userdata) {
     APP_CTX *app = userdata;
     const VENC_PACK_S *pack = stream->pstPack;
-    RK_S32 ret;
+    RK_S32 ret = 0;
+    bool send_rtmp, send_rtsp;
+
     pthread_mutex_lock(&app->lock);
-    bool write_frame = app->running && app->muxer_ready;
+    send_rtmp = app->running && app->muxer_ready;
+    send_rtsp = app->running && app->rtsp_ready;
     pthread_mutex_unlock(&app->lock);
-    if (!write_frame) return;
+    if (!send_rtmp && !send_rtsp) return;
     unsigned char *data = RK_MPI_MB_Handle2VirAddr(pack->pMbBlk);
     pthread_mutex_lock(&app->muxer_lock);
-    ret = rkmuxer_write_video_frame(MUXER_ID, data, pack->u32Len,
-                                     pack->u64PTS, is_h265_keyframe(pack));
+    if (send_rtmp)
+        ret = rkmuxer_write_video_frame(MUXER_ID, data, pack->u32Len,
+                                         pack->u64PTS, is_h265_keyframe(pack));
+    if (send_rtsp) {
+        rtsp_tx_video(app->rtsp_session, data, pack->u32Len, pack->u64PTS);
+        rtsp_do_event(app->rtsp_demo);
+    }
     pthread_mutex_unlock(&app->muxer_lock);
-    if (ret != 0) fprintf(stderr, "RTMP video write failed: %d\n", ret);
+    if (send_rtmp && ret != 0)
+        fprintf(stderr, "RTMP video write failed: %d\n", ret);
 }
 
 static void rtmp_audio_callback(const AUDIO_STREAM_S *stream, void *userdata) {
@@ -436,11 +454,13 @@ static RK_S32 init_audio(APP_CTX *app) {
     return RK_SUCCESS;
 }
 
-static RK_S32 init_streaming(APP_CTX *app, const char *rtmp_url) {
+static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
     VideoParam video;
     AudioParam audio;
-    if (!rtmp_url || !rtmp_url[0]) {
-        printf("RTMP disabled: no server URL was supplied\n");
+    bool rtmp_enabled = config->rtmp_url[0] != '\0';
+
+    if (!rtmp_enabled && !config->rtsp_enabled) {
+        printf("RTMP and RTSP disabled\n");
         return RK_SUCCESS;
     }
     memset(&app->venc, 0, sizeof(app->venc));
@@ -468,33 +488,53 @@ static RK_S32 init_streaming(APP_CTX *app, const char *rtmp_url) {
     if (SAMPLE_COMM_AENC_CreateChn(&app->aenc) != RK_SUCCESS) return RK_FAILURE;
     app->aenc_ready = true;
 
+    app->venc_src = app->frame_source == FRAME_SOURCE_VPSS
+        ? app->vpss_stream_src : app->vi_src;
     app->venc_dst = (MPP_CHN_S){RK_ID_VENC, 0, app->venc.s32ChnId};
-    if (SAMPLE_COMM_Bind(&app->vi_src, &app->venc_dst) != RK_SUCCESS)
+    if (SAMPLE_COMM_Bind(&app->venc_src, &app->venc_dst) != RK_SUCCESS)
         return RK_FAILURE;
     app->venc_bound = true;
 
-    memset(&video, 0, sizeof(video));
-    snprintf(video.format, sizeof(video.format), "NV12");
-    snprintf(video.codec, sizeof(video.codec), "H.265");
-    video.width = 1920; video.height = 1080;
-    video.vir_width = 1920; video.vir_height = 1080;
-    video.bit_rate = VIDEO_BITRATE_KBPS * 1000;
-    video.frame_rate_num = VIDEO_FPS; video.frame_rate_den = 1;
-    memset(&audio, 0, sizeof(audio));
-    snprintf(audio.format, sizeof(audio.format), "S16");
-    snprintf(audio.codec, sizeof(audio.codec), "ACC");
-    audio.channels = 1; audio.sample_rate = AUDIO_RATE;
-    audio.frame_size = AUDIO_SAMPLES;
-    if (rkmuxer_init(MUXER_ID, "flv", rtmp_url, &video, &audio) != 0)
-        return RK_FAILURE;
-    app->muxer_ready = true;
+    if (rtmp_enabled) {
+        memset(&video, 0, sizeof(video));
+        snprintf(video.format, sizeof(video.format), "NV12");
+        snprintf(video.codec, sizeof(video.codec), "H.265");
+        video.width = 1920; video.height = 1080;
+        video.vir_width = 1920; video.vir_height = 1080;
+        video.bit_rate = VIDEO_BITRATE_KBPS * 1000;
+        video.frame_rate_num = VIDEO_FPS; video.frame_rate_den = 1;
+        memset(&audio, 0, sizeof(audio));
+        snprintf(audio.format, sizeof(audio.format), "S16");
+        snprintf(audio.codec, sizeof(audio.codec), "ACC");
+        audio.channels = 1; audio.sample_rate = AUDIO_RATE;
+        audio.frame_size = AUDIO_SAMPLES;
+        if (rkmuxer_init(MUXER_ID, "flv", config->rtmp_url, &video, &audio) != 0)
+            return RK_FAILURE;
+        app->muxer_ready = true;
+    }
+    if (config->rtsp_enabled) {
+        app->rtsp_demo = create_rtsp_demo(config->rtsp_port);
+        if (!app->rtsp_demo) return RK_FAILURE;
+        app->rtsp_session = rtsp_new_session(app->rtsp_demo, config->rtsp_path);
+        if (!app->rtsp_session) return RK_FAILURE;
+        if (rtsp_set_video(app->rtsp_session, RTSP_CODEC_ID_VIDEO_H265,
+                           NULL, 0) != 0)
+            return RK_FAILURE;
+        rtsp_sync_video_ts(app->rtsp_session, rtsp_get_reltime(),
+                           rtsp_get_ntptime());
+        app->rtsp_ready = true;
+    }
     if (media_callbacks_start(&app->stream_callbacks, app->venc.s32ChnId,
-                              app->aenc.s32ChnId, rtmp_video_callback,
+                              app->aenc.s32ChnId, streaming_video_callback,
                               rtmp_audio_callback, app) != 0)
         return RK_FAILURE;
     app->stream_callbacks_ready = true;
-    printf("RTMP publishing: %s (H.265 1920x1080@%d, AAC %d Hz mono)\n",
-           rtmp_url, VIDEO_FPS, AUDIO_RATE);
+    if (rtmp_enabled)
+        printf("RTMP publishing: %s (H.265 1920x1080@%d, AAC %d Hz mono)\n",
+               config->rtmp_url, VIDEO_FPS, AUDIO_RATE);
+    if (config->rtsp_enabled)
+        printf("RTSP serving: rtsp://0.0.0.0:%d%s (H.265 1920x1080@%d)\n",
+               config->rtsp_port, config->rtsp_path, VIDEO_FPS);
     return RK_SUCCESS;
 }
 
@@ -516,26 +556,36 @@ static RK_S32 init_video(APP_CTX *app) {
     if (app->frame_source == FRAME_SOURCE_VI) return RK_SUCCESS;
 
     memset(&app->vpss, 0, sizeof(app->vpss));
-    app->vpss.s32GrpId = 0; app->vpss.s32ChnId = 0;
+    app->vpss.s32GrpId = 0; app->vpss.s32ChnId = VPSS_PREVIEW_CHN;
     app->vpss.enVProcDevType = VIDEO_PROC_DEV_RGA;
     app->vpss.stGrpVpssAttr.enPixelFormat = RK_FMT_YUV420SP;
     app->vpss.stGrpVpssAttr.enCompressMode = COMPRESS_MODE_NONE;
-    app->vpss.s32ChnRotation[0] = ROTATION_0;
+    app->vpss.s32ChnRotation[VPSS_PREVIEW_CHN] = ROTATION_0;
     app->vpss.stGrpVpssAttr.u32MaxW = VIDEO_W;
     app->vpss.stGrpVpssAttr.u32MaxH = VIDEO_H;
-    app->vpss.stVpssChnAttr[0].enChnMode = VPSS_CHN_MODE_USER;
-    app->vpss.stVpssChnAttr[0].enCompressMode = COMPRESS_MODE_NONE;
-    app->vpss.stVpssChnAttr[0].enDynamicRange = DYNAMIC_RANGE_SDR8;
-    app->vpss.stVpssChnAttr[0].enPixelFormat = RK_FMT_RGB888;
-    app->vpss.stVpssChnAttr[0].stFrameRate.s32SrcFrameRate = -1;
-    app->vpss.stVpssChnAttr[0].stFrameRate.s32DstFrameRate = -1;
-    app->vpss.stVpssChnAttr[0].u32Depth = 1;
-    app->vpss.stVpssChnAttr[0].u32Width = VIDEO_W;
-    app->vpss.stVpssChnAttr[0].u32Height = VIDEO_H;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].enChnMode = VPSS_CHN_MODE_USER;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].enCompressMode = COMPRESS_MODE_NONE;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].enDynamicRange = DYNAMIC_RANGE_SDR8;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].enPixelFormat = RK_FMT_RGB888;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].stFrameRate.s32SrcFrameRate = -1;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].stFrameRate.s32DstFrameRate = -1;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].u32Depth = 1;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].u32Width = VIDEO_W;
+    app->vpss.stVpssChnAttr[VPSS_PREVIEW_CHN].u32Height = VIDEO_H;
+    app->vpss.s32ChnRotation[VPSS_STREAM_CHN] = ROTATION_0;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].enChnMode = VPSS_CHN_MODE_USER;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].enCompressMode = COMPRESS_MODE_NONE;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].enDynamicRange = DYNAMIC_RANGE_SDR8;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].enPixelFormat = RK_FMT_YUV420SP;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].stFrameRate.s32SrcFrameRate = -1;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].stFrameRate.s32DstFrameRate = -1;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].u32Width = 1920;
+    app->vpss.stVpssChnAttr[VPSS_STREAM_CHN].u32Height = 1080;
     if (SAMPLE_COMM_VPSS_CreateChn(&app->vpss) != RK_SUCCESS) return RK_FAILURE;
     app->vpss_ready = true;
     app->vpss_dst = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
-    app->vpss_src = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
+    app->vpss_src = (MPP_CHN_S){RK_ID_VPSS, 0, VPSS_PREVIEW_CHN};
+    app->vpss_stream_src = (MPP_CHN_S){RK_ID_VPSS, 0, VPSS_STREAM_CHN};
     if (SAMPLE_COMM_Bind(&app->vi_src, &app->vpss_dst) != RK_SUCCESS)
         return RK_FAILURE;
     return RK_SUCCESS;
@@ -689,7 +739,9 @@ static void cleanup(APP_CTX *app) {
     if (app->audio_thread_ready) pthread_join(app->audio_thread, NULL);
     if (app->stream_callbacks_ready) media_callbacks_stop(&app->stream_callbacks);
     if (app->muxer_ready) rkmuxer_deinit(MUXER_ID);
-    if (app->venc_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->venc_dst);
+    if (app->rtsp_session) rtsp_del_session(app->rtsp_session);
+    if (app->rtsp_demo) rtsp_del_demo(app->rtsp_demo);
+    if (app->venc_bound) SAMPLE_COMM_UnBind(&app->venc_src, &app->venc_dst);
     if (app->aenc_ready) SAMPLE_COMM_AENC_DestroyChn(&app->aenc);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
     if (app->video_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
@@ -709,7 +761,7 @@ static void cleanup(APP_CTX *app) {
 
 static void print_usage(const char *program) {
     fprintf(stderr,
-            "Usage: %s [iq_dir] [rtmp_url] [--lvgl] "
+            "Usage: %s [iq_dir] [rtmp_url] [--config=path] [--lvgl] "
             "[--frame-source=vi|vpss]\n", program);
 }
 
@@ -719,16 +771,31 @@ static void print_usage(const char *program) {
 */
 int main(int argc, char **argv) {
     APP_CTX app;
-    const char *iq_dir = "/etc/iqfiles";
-    const char *rtmp_url = NULL;
-    bool lvgl_preview = false;
-    FRAME_SOURCE_E frame_source = FRAME_SOURCE_VI;
+    camera_config_t config;
+    const char *config_path = "/userdata/camera_live.conf";
+    bool config_explicit = false;
+    FRAME_SOURCE_E frame_source;
     int positional = 0;
     int i;
 
+    camera_config_defaults(&config);
+    for (i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--config=", 9) == 0) {
+            config_path = argv[i] + 9;
+            config_explicit = true;
+        }
+    }
+    if ((config_explicit || access(config_path, R_OK) == 0) &&
+        camera_config_load(&config, config_path) != 0)
+        return 2;
+    frame_source = strcmp(config.frame_source, "vpss") == 0
+        ? FRAME_SOURCE_VPSS : FRAME_SOURCE_VI;
+
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--lvgl") == 0) {
-            lvgl_preview = true;
+            config.lvgl = true;
+        } else if (strncmp(argv[i], "--config=", 9) == 0) {
+            continue;
         } else if (strncmp(argv[i], "--frame-source=", 15) == 0) {
             const char *value = argv[i] + 15;
             if (strcmp(value, "vi") == 0)
@@ -749,9 +816,9 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 2;
         } else if (positional++ == 0) {
-            iq_dir = argv[i];
+            snprintf(config.iq_dir, sizeof(config.iq_dir), "%s", argv[i]);
         } else if (positional == 2) {
-            rtmp_url = argv[i];
+            snprintf(config.rtmp_url, sizeof(config.rtmp_url), "%s", argv[i]);
         } else {
             fprintf(stderr, "Too many positional arguments\n");
             print_usage(argv[0]);
@@ -762,13 +829,15 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&app.lock, NULL);
     pthread_mutex_init(&app.muxer_lock, NULL);
     app.running = true; app.audio_enabled = true;
-    app.lvgl_preview = lvgl_preview;
+    app.lvgl_preview = config.lvgl;
     app.frame_source = frame_source;
     printf("Frame source: %s\n",
            frame_source == FRAME_SOURCE_VPSS ? "VPSS" : "VI");
     signal(SIGINT, signal_handler); signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
-    if (SAMPLE_COMM_ISP_Init(0, RK_AIQ_WORKING_MODE_NORMAL, RK_FALSE, iq_dir)
+    if (SAMPLE_COMM_ISP_Init(0, RK_AIQ_WORKING_MODE_NORMAL, RK_FALSE,
+                             config.iq_dir)
         != RK_SUCCESS) {
         fprintf(stderr, "RKAIQ initialization failed\n"); cleanup(&app); return 1;
     }
@@ -790,9 +859,8 @@ int main(int argc, char **argv) {
     if (init_audio(&app) != RK_SUCCESS) {
         fprintf(stderr, "audio initialization failed\n"); cleanup(&app); return 1;
     }
-    if (init_streaming(&app, rtmp_url) != RK_SUCCESS) {
-        fprintf(stderr, "RTMP initialization failed for: %s\n",
-                rtmp_url ? rtmp_url : "(none)");
+    if (init_streaming(&app, &config) != RK_SUCCESS) {
+        fprintf(stderr, "streaming initialization failed\n");
         cleanup(&app); return 1;
     }
     if (pthread_create(&app.audio_thread, NULL, audio_loop, &app) != 0) {

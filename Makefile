@@ -12,6 +12,7 @@ LVGL := $(SDK_ROOT)/project/app/component/lvgl/out
 TARGETS := camera_capture camera_live
 UI_SRC := ui/camera_ui.c
 STREAM_SRC := media_callbacks.c
+CONFIG_SRC := camera_config.c
 
 CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
 	-D_FILE_OFFSET_BITS=64 -march=armv7-a -mfpu=neon -mfloat-abi=hard \
@@ -26,7 +27,7 @@ CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
 
 LDFLAGS := -L$(COMMON)/lib -lsample_comm -L$(MEDIA_OUT)/lib \
 	-Wl,-rpath-link,$(MEDIA_OUT)/lib:$(MEDIA_OUT)/root/usr/lib \
-	-lrkaiq -lrockit_full -lrkmuxer -lpthread
+	-lrkaiq -lrockit_full -lrkmuxer -lrtsp -lpthread
 
 LVGL_LDFLAGS := -L$(LVGL)/lib -llvgl -lm
 
@@ -42,7 +43,7 @@ check:
 camera_capture: camera_capture.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-camera_live: camera_live.c $(UI_SRC) $(STREAM_SRC)
+camera_live: camera_live.c $(UI_SRC) $(STREAM_SRC) $(CONFIG_SRC)
 	@test -f $(LVGL)/lib/liblvgl.a || \
 		(echo "Build LVGL first: make -C project/app/component/lvgl RK_ENABLE_LVGL=y"; exit 1)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LVGL_LDFLAGS)

@@ -70,6 +70,20 @@ chmod +x /userdata/camera_live
 /userdata/camera_live /etc/iqfiles
 ```
 
+`camera_live` reads `/userdata/camera_live.conf` when it exists. Use another
+file with `--config=/path/to/camera_live.conf`. Command-line IQ, RTMP,
+`--lvgl`, and `--frame-source` values override the loaded configuration.
+
+```ini
+iq_dir=/etc/iqfiles
+frame_source=vi
+lvgl=false
+rtmp_url=rtmp://192.168.1.10/live/camera01
+rtsp_enabled=true
+rtsp_port=554
+rtsp_path=/live/0
+```
+
 The framebuffer preview reads frames from VI by default. Select VPSS when the
 preview should use its RGB888 output instead:
 
@@ -80,6 +94,10 @@ preview should use its RGB888 output instead:
 
 VPSS mode binds VI channel 1 to VPSS group 0/channel 0 and does not create or
 bind a VO channel.
+
+The RTMP encoder follows `--frame-source` as well. VI mode binds VI directly
+to VENC. VPSS mode uses a separate 1920x1080 NV12 VPSS output channel for VENC,
+while channel 0 remains the RGB888 framebuffer preview source.
 
 To keep the local preview and publish H.265 video plus AAC audio at the same
 time, pass the RTMP destination as the second argument:
@@ -94,9 +112,18 @@ AAC at 32 kbit/s. Play/pause controls both local preview and RTMP output;
 mute only affects the local speaker. The RTMP server and player must support
 H.265 in FLV/RTMP.
 
-Encoded VENC and AENC frames are delivered to the RTMP writer through
-registered callbacks. `media_callbacks.c` owns frame retrieval and release,
-following the callback lifecycle used by RKADK's `rkadk_rtmp.c`.
+When RTSP is enabled, the same H.265 encoder stream is available at:
+
+```sh
+ffplay rtsp://<board-ip>:554/live/0
+```
+
+The SDK RTSP server supports H.265 video but not the application's AAC audio,
+so RTSP is video-only. RTMP continues to carry both H.265 video and AAC audio.
+
+Encoded VENC frames are dispatched to every enabled streaming protocol, while
+AENC frames are delivered to RTMP. `media_callbacks.c` owns frame retrieval
+and release.
 
 The microphone is played through the nearby speaker, so acoustic feedback is
 possible. Start with low volume and keep the microphone away from the speaker.

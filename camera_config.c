@@ -45,6 +45,13 @@ void camera_config_defaults(camera_config_t *config) {
     snprintf(config->iq_dir, sizeof(config->iq_dir), "/etc/iqfiles");
     config->rtsp_port = 554;
     snprintf(config->rtsp_path, sizeof(config->rtsp_path), "/live/0");
+    config->onvif_enabled = true;
+    config->onvif_port = 8080;
+    snprintf(config->onvif_device_name, sizeof(config->onvif_device_name),
+             "Luckfox Camera");
+    snprintf(config->onvif_interface, sizeof(config->onvif_interface), "eth0");
+    snprintf(config->onvif_username, sizeof(config->onvif_username), "admin");
+    snprintf(config->onvif_password, sizeof(config->onvif_password), "admin");
     snprintf(config->frame_source, sizeof(config->frame_source), "vi");
     snprintf(config->video_codec, sizeof(config->video_codec), "h265");
     snprintf(config->audio_codec, sizeof(config->audio_codec), "aac");
@@ -93,6 +100,28 @@ int camera_config_load(camera_config_t *config, const char *path) {
         } else if (strcmp(key, "rtsp_path") == 0) {
             if (value[0] != '/') goto invalid_value;
             if (copy_value(config->rtsp_path, sizeof(config->rtsp_path), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "onvif_enabled") == 0) {
+            if (parse_bool(value, &config->onvif_enabled)) goto invalid_value;
+        } else if (strcmp(key, "onvif_port") == 0) {
+            port = strtol(value, &end, 10);
+            if (*end || port < 1 || port > 65535) goto invalid_value;
+            config->onvif_port = (int)port;
+        } else if (strcmp(key, "onvif_device_name") == 0) {
+            if (copy_value(config->onvif_device_name,
+                           sizeof(config->onvif_device_name), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "onvif_interface") == 0) {
+            if (copy_value(config->onvif_interface,
+                           sizeof(config->onvif_interface), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "onvif_username") == 0) {
+            if (copy_value(config->onvif_username,
+                           sizeof(config->onvif_username), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "onvif_password") == 0) {
+            if (copy_value(config->onvif_password,
+                           sizeof(config->onvif_password), value,
                            key, line_number)) goto invalid;
         } else if (strcmp(key, "frame_source") == 0) {
             if (strcmp(value, "vi") != 0 && strcmp(value, "vpss") != 0)

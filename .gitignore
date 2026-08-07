@@ -3,3 +3,9 @@ camera_live
 camera_simulator
 *.o
 build-sim/
+/onvif_srvd
+/wsdd
+third_party/onvif_srvd/SDK/
+third_party/onvif_srvd/gsoap-2.8/
+third_party/onvif_srvd/build-rv1106/
+third_party/wsdd/build-rv1106/

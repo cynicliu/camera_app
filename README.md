@@ -168,6 +168,30 @@ Encoded VENC frames are dispatched to every enabled streaming protocol.
 `media_callbacks.c` owns video frame retrieval and release; `aac_encoder.c`
 and `audio_encoder.c` own PCM accumulation and software audio encoding.
 
+## ONVIF
+
+The ONVIF service uses the GPLv2 `onvif_srvd` and `wsdd` projects with gSOAP
+2.8.143 and WS-Security enabled. `wsdd` provides WS-Discovery on UDP port 3702;
+`onvif_srvd` provides generated Device, Media, and PTZ SOAP bindings. PTZ is not
+advertised because this camera has no PTZ backend. The media profile follows
+the active H.264/H.265 encoder and returns the Live555 stream URI.
+
+```ini
+onvif_enabled=true
+onvif_port=8080
+onvif_device_name=Luckfox Camera
+onvif_interface=eth0
+onvif_username=admin
+onvif_password=admin
+```
+
+Device service URL: `http://<board-ip>:8080/onvif/device_service`.
+
+Install `onvif_srvd` and `wsdd` beside `camera_live` in `/usr/bin`. For a
+development layout, set `ONVIF_SRVD_PATH` and `WSDD_PATH` to their locations.
+The vendored ONVIF/gSOAP generated code is GPLv2; distributing the resulting
+firmware requires compliance with that license.
+
 The microphone is played through the nearby speaker, so acoustic feedback is
 possible. Start with low volume and keep the microphone away from the speaker.
 

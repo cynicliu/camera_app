@@ -10,17 +10,20 @@ MEDIA_OUT := $(MEDIA)/out
 SAMPLE := $(MEDIA)/samples/example
 COMMON := $(SAMPLE)/common
 LVGL := $(SDK_ROOT)/project/app/component/lvgl/out
-TARGETS := camera_capture camera_live
+TARGETS := camera_capture camera_live onvif_srvd wsdd
 UI_SRC := ui/camera_ui.c
 STREAM_SRC := media_callbacks.c
 CONFIG_SRC := camera_config.c
 AAC_SRC := aac_encoder.c
 AUDIO_ENCODER_SRC := audio_encoder.c
 LIVE555_SRC := live555_rtsp_server.cpp
+ONVIF_SRC := onvif_server.c
 LIVE555_STAGING := $(SDK_ROOT)/sysdrv/source/buildroot/buildroot-2023.02.6/output/staging/usr
 LIVE555_LIB := $(LIVE555_STAGING)/lib
+ONVIF_SRVD_DIR := third_party/onvif_srvd
+WSDD_DIR := third_party/wsdd
 CAMERA_LIVE_OBJS := camera_live.o ui/camera_ui.o media_callbacks.o camera_config.o \
-	aac_encoder.o live555_rtsp_server.o
+	aac_encoder.o live555_rtsp_server.o onvif_server.o
 
 CAMERA_LIVE_OBJS += audio_encoder.o
 
@@ -56,7 +59,7 @@ LIVE555_LDFLAGS := -L$(LIVE555_LIB) \
 
 LVGL_LDFLAGS := -L$(LVGL)/lib -llvgl -lm
 
-.PHONY: all clean check simulator simulator-lvgl
+.PHONY: all clean clean-onvif check simulator simulator-lvgl onvif-daemons
 
 all: check $(TARGETS)
 
@@ -69,7 +72,7 @@ check:
 camera_capture: camera_capture.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-camera_live: $(CAMERA_LIVE_OBJS)
+camera_live: $(CAMERA_LIVE_OBJS) | onvif-daemons
 	@test -f $(LVGL)/lib/liblvgl.a || \
 		(echo "Build LVGL first: make -C project/app/component/lvgl RK_ENABLE_LVGL=y"; exit 1)
 	@test -f $(LIVE555_LIB)/libliveMedia.so || \
@@ -78,6 +81,21 @@ camera_live: $(CAMERA_LIVE_OBJS)
 		(echo "Missing FFmpeg libavcodec in Buildroot staging"; exit 1)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(FFMPEG_LDFLAGS) $(LIVE555_LDFLAGS) \
 		$(LVGL_LDFLAGS)
+
+onvif-daemons: onvif_srvd wsdd
+
+onvif_srvd:
+	cmake -S $(ONVIF_SRVD_DIR) -B $(ONVIF_SRVD_DIR)/build-rv1106 \
+		-DWSSE_ON=1 \
+		-DCMAKE_TOOLCHAIN_FILE=cmake/rv1106-toolchain.cmake
+	cmake --build $(ONVIF_SRVD_DIR)/build-rv1106 -j2
+	cp $(ONVIF_SRVD_DIR)/build-rv1106/onvif_srvd $@
+
+wsdd: onvif_srvd
+	cmake -S $(WSDD_DIR) -B $(WSDD_DIR)/build-rv1106 \
+		-DCMAKE_TOOLCHAIN_FILE=cmake/rv1106-toolchain.cmake
+	cmake --build $(WSDD_DIR)/build-rv1106 -j2
+	cp $(WSDD_DIR)/build-rv1106/wsdd $@
 
 SIM_BUILD := build-sim
 SIM_LVGL := $(SIM_BUILD)/lvgl
@@ -102,3 +120,6 @@ clean:
 	rm -f $(TARGETS) camera_simulator
 	rm -f $(CAMERA_LIVE_OBJS)
 	rm -rf $(SIM_BUILD)
+
+clean-onvif:
+	rm -rf $(ONVIF_SRVD_DIR)/build-rv1106 $(WSDD_DIR)/build-rv1106

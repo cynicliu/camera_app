@@ -28,6 +28,7 @@
 #include "camera_ui.h"
 #include "audio_encoder.h"
 #include "live555_rtsp_server.h"
+#include "onvif_server.h"
 #include "media_callbacks.h"
 
 #define SCREEN_W 480
@@ -78,6 +79,7 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_mutex_t muxer_lock;
     live555_rtsp_server_t *rtsp_server;
+    onvif_server_t *onvif_server;
     audio_encoder_t *audio_encoder;
     bool running;
     bool audio_enabled;
@@ -523,6 +525,34 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
     return RK_SUCCESS;
 }
 
+static RK_S32 init_onvif(APP_CTX *app, const camera_config_t *config) {
+    onvif_server_config_t onvif;
+    if (!config->onvif_enabled) return RK_SUCCESS;
+    if (!config->rtsp_enabled || !app->rtsp_ready) {
+        fprintf(stderr, "ONVIF requires the RTSP service to be enabled\n");
+        return RK_FAILURE;
+    }
+    memset(&onvif, 0, sizeof(onvif));
+    onvif.http_port = config->onvif_port;
+    onvif.rtsp_port = config->rtsp_port;
+    onvif.rtsp_path = config->rtsp_path;
+    onvif.device_name = config->onvif_device_name;
+    onvif.device_scope = "onvif://www.onvif.org/name/Luckfox_Camera";
+    onvif.interface_name = config->onvif_interface;
+    onvif.username = config->onvif_username;
+    onvif.password = config->onvif_password;
+    onvif.video_codec = app->video_codec == VIDEO_CODEC_H264 ? "h264" : "h265";
+    onvif.audio_codec = app->audio_codec == AUDIO_CODEC_AAC ? "aac" : "mp3";
+    onvif.width = 1920;
+    onvif.height = 1080;
+    onvif.frame_rate = VIDEO_FPS;
+    onvif.video_bitrate_kbps = VIDEO_BITRATE_KBPS;
+    onvif.audio_sample_rate = AUDIO_RATE;
+    onvif.audio_bitrate = AUDIO_BITRATE;
+    return onvif_server_start(&app->onvif_server, &onvif) == 0
+        ? RK_SUCCESS : RK_FAILURE;
+}
+
 static RK_S32 init_video(APP_CTX *app) {
     memset(&app->vi, 0, sizeof(app->vi));
     app->vi.u32Width = VIDEO_W; app->vi.u32Height = VIDEO_H;
@@ -725,6 +755,7 @@ static void cleanup(APP_CTX *app) {
     }
     if (app->stream_callbacks_ready) media_callbacks_stop(&app->stream_callbacks);
     if (app->muxer_ready) rkmuxer_deinit(MUXER_ID);
+    if (app->onvif_server) onvif_server_stop(app->onvif_server);
     if (app->rtsp_server) live555_rtsp_server_stop(app->rtsp_server);
     if (app->venc_bound) SAMPLE_COMM_UnBind(&app->venc_src, &app->venc_dst);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
@@ -876,6 +907,10 @@ int main(int argc, char **argv) {
     }
     if (init_streaming(&app, &config) != RK_SUCCESS) {
         fprintf(stderr, "streaming initialization failed\n");
+        cleanup(&app); return 1;
+    }
+    if (init_onvif(&app, &config) != RK_SUCCESS) {
+        fprintf(stderr, "ONVIF initialization failed\n");
         cleanup(&app); return 1;
     }
     if (pthread_create(&app.audio_thread, NULL, audio_loop, &app) != 0) {

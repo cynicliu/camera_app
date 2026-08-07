@@ -16,7 +16,6 @@
 
 #include "sample_comm.h"
 #include "rk_mpi_ai.h"
-#include "rk_mpi_aenc.h"
 #include "rk_mpi_amix.h"
 #include "rk_mpi_ao.h"
 #include "rk_mpi_mb.h"
@@ -24,10 +23,11 @@
 #include "rk_mpi_vo.h"
 #include "rk_mpi_venc.h"
 #include "rkmuxer.h"
-#include "rtsp_demo.h"
 #include "lvgl/lvgl.h"
 #include "camera_config.h"
 #include "camera_ui.h"
+#include "audio_encoder.h"
+#include "live555_rtsp_server.h"
 #include "media_callbacks.h"
 
 #define SCREEN_W 480
@@ -52,6 +52,16 @@ typedef enum {
     FRAME_SOURCE_VPSS,
 } FRAME_SOURCE_E;
 
+typedef enum {
+    VIDEO_CODEC_H264,
+    VIDEO_CODEC_H265,
+} VIDEO_CODEC_E;
+
+typedef enum {
+    AUDIO_CODEC_AAC,
+    AUDIO_CODEC_MP3,
+} AUDIO_CODEC_E;
+
 typedef struct {
     SAMPLE_VI_CTX_S vi;
     SAMPLE_VPSS_CTX_S vpss;
@@ -59,7 +69,6 @@ typedef struct {
     SAMPLE_AI_CTX_S ai;
     SAMPLE_AO_CTX_S ao;
     SAMPLE_VENC_CTX_S venc;
-    SAMPLE_AENC_CTX_S aenc;
     MPP_CHN_S vi_src;
     MPP_CHN_S vpss_dst;
     MPP_CHN_S vpss_src;
@@ -72,12 +81,14 @@ typedef struct {
     media_callbacks_t stream_callbacks;
     pthread_mutex_t lock;
     pthread_mutex_t muxer_lock;
-    rtsp_demo_handle rtsp_demo;
-    rtsp_session_handle rtsp_session;
+    live555_rtsp_server_t *rtsp_server;
+    audio_encoder_t *audio_encoder;
     bool running;
     bool audio_enabled;
     bool lvgl_preview;
     FRAME_SOURCE_E frame_source;
+    VIDEO_CODEC_E video_codec;
+    AUDIO_CODEC_E audio_codec;
     bool quit;
     bool isp_ready;
     bool mpi_ready;
@@ -90,7 +101,6 @@ typedef struct {
     bool audio_thread_ready;
     bool preview_thread_ready;
     bool venc_ready;
-    bool aenc_ready;
     bool venc_bound;
     bool muxer_ready;
     bool rtsp_ready;
@@ -351,7 +361,7 @@ static void *audio_loop(void *opaque) {
         if (ret != RK_SUCCESS) continue;
         pthread_mutex_lock(&app->lock);
         play = app->running && app->audio_enabled;
-        stream = app->running && app->muxer_ready;
+        stream = app->running && (app->muxer_ready || app->rtsp_ready);
         pthread_mutex_unlock(&app->lock);
         if (play) {
             frame.bBypassMbBlk = RK_FALSE;
@@ -360,17 +370,21 @@ static void *audio_loop(void *opaque) {
                 fprintf(stderr, "audio output dropped: %#x\n", ret);
         }
         if (stream) {
-            frame.bBypassMbBlk = RK_FALSE;
-            ret = RK_MPI_AENC_SendFrame(app->aenc.s32ChnId, &frame, NULL, 200);
-            if (ret != RK_SUCCESS)
-                fprintf(stderr, "AAC input dropped: %#x\n", ret);
+            const int16_t *samples = RK_MPI_MB_Handle2VirAddr(frame.pMbBlk);
+            if (audio_encoder_push_s16(app->audio_encoder, samples,
+                                       frame.u32Len / sizeof(*samples),
+                                       frame.u64TimeStamp) != 0)
+                fprintf(stderr, "software audio encoder dropped PCM\n");
         }
         RK_MPI_AI_ReleaseFrame(0, 0, &frame, NULL);
     }
     return NULL;
 }
 
-static bool is_h265_keyframe(const VENC_PACK_S *pack) {
+static bool is_video_keyframe(const APP_CTX *app, const VENC_PACK_S *pack) {
+    if (app->video_codec == VIDEO_CODEC_H264)
+        return pack->DataType.enH264EType == H264E_NALU_ISLICE ||
+               pack->DataType.enH264EType == H264E_NALU_IDRSLICE;
     return pack->DataType.enH265EType == H265E_NALU_ISLICE ||
            pack->DataType.enH265EType == H265E_NALU_IDRSLICE;
 }
@@ -390,31 +404,40 @@ static void streaming_video_callback(const VENC_STREAM_S *stream, void *userdata
     pthread_mutex_lock(&app->muxer_lock);
     if (send_rtmp)
         ret = rkmuxer_write_video_frame(MUXER_ID, data, pack->u32Len,
-                                         pack->u64PTS, is_h265_keyframe(pack));
+                                         pack->u64PTS,
+                                         is_video_keyframe(app, pack));
     if (send_rtsp) {
-        rtsp_tx_video(app->rtsp_session, data, pack->u32Len, pack->u64PTS);
-        rtsp_do_event(app->rtsp_demo);
+        if (live555_rtsp_server_push_video(app->rtsp_server, data,
+                                           pack->u32Len, pack->u64PTS) != 0)
+            fprintf(stderr, "RTSP video queue dropped a frame\n");
     }
     pthread_mutex_unlock(&app->muxer_lock);
     if (send_rtmp && ret != 0)
         fprintf(stderr, "RTMP video write failed: %d\n", ret);
 }
 
-static void rtmp_audio_callback(const AUDIO_STREAM_S *stream, void *userdata) {
+static void streaming_audio_packet(const uint8_t *data, size_t size,
+                                   uint64_t pts_us, void *userdata) {
     APP_CTX *app = userdata;
-    const unsigned int adts_header_size = 7;
-    RK_S32 ret;
+    RK_S32 ret = 0;
+    bool send_rtmp, send_rtsp;
+
     pthread_mutex_lock(&app->lock);
-    bool write_frame = app->running && app->muxer_ready;
+    send_rtmp = app->running && app->muxer_ready;
+    send_rtsp = app->running && app->rtsp_ready;
     pthread_mutex_unlock(&app->lock);
-    if (!write_frame || stream->u32Len <= adts_header_size) return;
-    unsigned char *data = RK_MPI_MB_Handle2VirAddr(stream->pMbBlk);
-    pthread_mutex_lock(&app->muxer_lock);
-    ret = rkmuxer_write_audio_frame(MUXER_ID, data + adts_header_size,
-                                     stream->u32Len - adts_header_size,
-                                     stream->u64TimeStamp);
-    pthread_mutex_unlock(&app->muxer_lock);
-    if (ret != 0) fprintf(stderr, "RTMP audio write failed: %d\n", ret);
+    if (!send_rtmp && !send_rtsp) return;
+    if (send_rtmp) {
+        pthread_mutex_lock(&app->muxer_lock);
+        ret = rkmuxer_write_audio_frame(MUXER_ID, (unsigned char *)data, size,
+                                         pts_us);
+        pthread_mutex_unlock(&app->muxer_lock);
+        if (ret != 0) fprintf(stderr, "RTMP audio write failed: %d\n", ret);
+    }
+    if (send_rtsp &&
+        live555_rtsp_server_push_audio(app->rtsp_server,
+                                       data, size, pts_us) != 0)
+        fprintf(stderr, "RTSP audio queue dropped a frame\n");
 }
 
 static RK_S32 init_audio(APP_CTX *app) {
@@ -470,23 +493,12 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
     app->venc.u32BitRate = VIDEO_BITRATE_KBPS;
     app->venc.u32StreamBufCnt = 3; app->venc.u32BuffSize = 1920 * 1080 / 2;
     app->venc.enPixelFormat = RK_FMT_YUV420SP;
-    app->venc.enCodecType = RK_CODEC_TYPE_H265;
-    app->venc.enRcMode = VENC_RC_MODE_H265CBR;
+    app->venc.enCodecType = app->video_codec == VIDEO_CODEC_H264
+        ? RK_CODEC_TYPE_H264 : RK_CODEC_TYPE_H265;
+    app->venc.enRcMode = app->video_codec == VIDEO_CODEC_H264
+        ? VENC_RC_MODE_H264CBR : VENC_RC_MODE_H265CBR;
     if (SAMPLE_COMM_VENC_CreateChn(&app->venc) != RK_SUCCESS) return RK_FAILURE;
     app->venc_ready = true;
-
-    memset(&app->aenc, 0, sizeof(app->aenc));
-    app->aenc.s32ChnId = 0;
-    app->aenc.stChnAttr.enType = RK_AUDIO_ID_ACC;
-    app->aenc.stChnAttr.u32BufCount = 4;
-    app->aenc.stChnAttr.stCodecAttr.enType = RK_AUDIO_ID_ACC;
-    app->aenc.stChnAttr.stCodecAttr.u32Channels = 1;
-    app->aenc.stChnAttr.stCodecAttr.u32SampleRate = AUDIO_RATE;
-    app->aenc.stChnAttr.stCodecAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
-    app->aenc.stChnAttr.stCodecAttr.u32Resv[0] = 2;
-    app->aenc.stChnAttr.stCodecAttr.u32Resv[1] = AUDIO_BITRATE;
-    if (SAMPLE_COMM_AENC_CreateChn(&app->aenc) != RK_SUCCESS) return RK_FAILURE;
-    app->aenc_ready = true;
 
     app->venc_src = app->frame_source == FRAME_SOURCE_VPSS
         ? app->vpss_stream_src : app->vi_src;
@@ -498,43 +510,61 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
     if (rtmp_enabled) {
         memset(&video, 0, sizeof(video));
         snprintf(video.format, sizeof(video.format), "NV12");
-        snprintf(video.codec, sizeof(video.codec), "H.265");
+        snprintf(video.codec, sizeof(video.codec), "%s",
+                 app->video_codec == VIDEO_CODEC_H264 ? "H.264" : "H.265");
         video.width = 1920; video.height = 1080;
         video.vir_width = 1920; video.vir_height = 1080;
         video.bit_rate = VIDEO_BITRATE_KBPS * 1000;
         video.frame_rate_num = VIDEO_FPS; video.frame_rate_den = 1;
         memset(&audio, 0, sizeof(audio));
         snprintf(audio.format, sizeof(audio.format), "S16");
-        snprintf(audio.codec, sizeof(audio.codec), "ACC");
+        snprintf(audio.codec, sizeof(audio.codec), "%s",
+                 app->audio_codec == AUDIO_CODEC_AAC ? "ACC" : "MP3");
         audio.channels = 1; audio.sample_rate = AUDIO_RATE;
-        audio.frame_size = AUDIO_SAMPLES;
+        audio.frame_size = app->audio_codec == AUDIO_CODEC_AAC ? 1024 : 576;
         if (rkmuxer_init(MUXER_ID, "flv", config->rtmp_url, &video, &audio) != 0)
             return RK_FAILURE;
         app->muxer_ready = true;
     }
     if (config->rtsp_enabled) {
-        app->rtsp_demo = create_rtsp_demo(config->rtsp_port);
-        if (!app->rtsp_demo) return RK_FAILURE;
-        app->rtsp_session = rtsp_new_session(app->rtsp_demo, config->rtsp_path);
-        if (!app->rtsp_session) return RK_FAILURE;
-        if (rtsp_set_video(app->rtsp_session, RTSP_CODEC_ID_VIDEO_H265,
-                           NULL, 0) != 0)
+        if (live555_rtsp_server_start(&app->rtsp_server, config->rtsp_port,
+                                      config->rtsp_path,
+                                      app->video_codec == VIDEO_CODEC_H264
+                                          ? LIVE555_VIDEO_H264
+                                          : LIVE555_VIDEO_H265,
+                                      app->audio_codec == AUDIO_CODEC_AAC
+                                          ? LIVE555_AUDIO_AAC
+                                          : LIVE555_AUDIO_MP3,
+                                      AUDIO_RATE, 1,
+                                      "1408") != 0)
             return RK_FAILURE;
-        rtsp_sync_video_ts(app->rtsp_session, rtsp_get_reltime(),
-                           rtsp_get_ntptime());
         app->rtsp_ready = true;
     }
+    if (audio_encoder_create(&app->audio_encoder,
+                             app->audio_codec == AUDIO_CODEC_AAC
+                                 ? AUDIO_ENCODER_AAC : AUDIO_ENCODER_MP3,
+                             AUDIO_RATE, 1, AUDIO_BITRATE,
+                             streaming_audio_packet, app) != 0)
+        return RK_FAILURE;
     if (media_callbacks_start(&app->stream_callbacks, app->venc.s32ChnId,
-                              app->aenc.s32ChnId, streaming_video_callback,
-                              rtmp_audio_callback, app) != 0)
+                              streaming_video_callback, app) != 0)
         return RK_FAILURE;
     app->stream_callbacks_ready = true;
     if (rtmp_enabled)
-        printf("RTMP publishing: %s (H.265 1920x1080@%d, AAC %d Hz mono)\n",
-               config->rtmp_url, VIDEO_FPS, AUDIO_RATE);
+        printf("RTMP publishing: %s (%s 1920x1080@%d, %s %d Hz mono)\n",
+               config->rtmp_url,
+               app->video_codec == VIDEO_CODEC_H264 ? "H.264" : "H.265",
+               VIDEO_FPS,
+               app->audio_codec == AUDIO_CODEC_AAC ? "AAC" : "MP3",
+               AUDIO_RATE);
     if (config->rtsp_enabled)
-        printf("RTSP serving: rtsp://0.0.0.0:%d%s (H.265 1920x1080@%d)\n",
-               config->rtsp_port, config->rtsp_path, VIDEO_FPS);
+        printf("RTSP serving: rtsp://0.0.0.0:%d%s "
+               "(%s 1920x1080@%d, %s %d Hz mono)\n",
+               config->rtsp_port, config->rtsp_path,
+               app->video_codec == VIDEO_CODEC_H264 ? "H.264" : "H.265",
+               VIDEO_FPS,
+               app->audio_codec == AUDIO_CODEC_AAC ? "AAC" : "MP3",
+               AUDIO_RATE);
     return RK_SUCCESS;
 }
 
@@ -737,12 +767,15 @@ static void cleanup(APP_CTX *app) {
     lvgl_framebuffer_close();
     if (app->preview_thread_ready) pthread_join(app->preview_thread, NULL);
     if (app->audio_thread_ready) pthread_join(app->audio_thread, NULL);
+    if (app->audio_encoder) {
+        audio_encoder_flush(app->audio_encoder);
+        audio_encoder_destroy(app->audio_encoder);
+        app->audio_encoder = NULL;
+    }
     if (app->stream_callbacks_ready) media_callbacks_stop(&app->stream_callbacks);
     if (app->muxer_ready) rkmuxer_deinit(MUXER_ID);
-    if (app->rtsp_session) rtsp_del_session(app->rtsp_session);
-    if (app->rtsp_demo) rtsp_del_demo(app->rtsp_demo);
+    if (app->rtsp_server) live555_rtsp_server_stop(app->rtsp_server);
     if (app->venc_bound) SAMPLE_COMM_UnBind(&app->venc_src, &app->venc_dst);
-    if (app->aenc_ready) SAMPLE_COMM_AENC_DestroyChn(&app->aenc);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
     if (app->video_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
     if (app->vpss_ready) SAMPLE_COMM_UnBind(&app->vi_src, &app->vpss_dst);
@@ -762,7 +795,8 @@ static void cleanup(APP_CTX *app) {
 static void print_usage(const char *program) {
     fprintf(stderr,
             "Usage: %s [iq_dir] [rtmp_url] [--config=path] [--lvgl] "
-            "[--frame-source=vi|vpss]\n", program);
+            "[--frame-source=vi|vpss] [--video-codec=h264|h265] "
+            "[--audio-codec=aac|mp3]\n", program);
 }
 
 /*
@@ -775,6 +809,8 @@ int main(int argc, char **argv) {
     const char *config_path = "/userdata/camera_live.conf";
     bool config_explicit = false;
     FRAME_SOURCE_E frame_source;
+    VIDEO_CODEC_E video_codec;
+    AUDIO_CODEC_E audio_codec;
     int positional = 0;
     int i;
 
@@ -790,6 +826,10 @@ int main(int argc, char **argv) {
         return 2;
     frame_source = strcmp(config.frame_source, "vpss") == 0
         ? FRAME_SOURCE_VPSS : FRAME_SOURCE_VI;
+    video_codec = strcmp(config.video_codec, "h264") == 0
+        ? VIDEO_CODEC_H264 : VIDEO_CODEC_H265;
+    audio_codec = strcmp(config.audio_codec, "mp3") == 0
+        ? AUDIO_CODEC_MP3 : AUDIO_CODEC_AAC;
 
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--lvgl") == 0) {
@@ -804,6 +844,28 @@ int main(int argc, char **argv) {
                 frame_source = FRAME_SOURCE_VPSS;
             else {
                 fprintf(stderr, "Invalid frame source: %s\n", value);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--video-codec=", 14) == 0) {
+            const char *value = argv[i] + 14;
+            if (strcmp(value, "h264") == 0)
+                video_codec = VIDEO_CODEC_H264;
+            else if (strcmp(value, "h265") == 0)
+                video_codec = VIDEO_CODEC_H265;
+            else {
+                fprintf(stderr, "Invalid video codec: %s\n", value);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--audio-codec=", 14) == 0) {
+            const char *value = argv[i] + 14;
+            if (strcmp(value, "aac") == 0)
+                audio_codec = AUDIO_CODEC_AAC;
+            else if (strcmp(value, "mp3") == 0)
+                audio_codec = AUDIO_CODEC_MP3;
+            else {
+                fprintf(stderr, "Invalid audio codec: %s\n", value);
                 print_usage(argv[0]);
                 return 2;
             }
@@ -831,8 +893,14 @@ int main(int argc, char **argv) {
     app.running = true; app.audio_enabled = true;
     app.lvgl_preview = config.lvgl;
     app.frame_source = frame_source;
+    app.video_codec = video_codec;
+    app.audio_codec = audio_codec;
     printf("Frame source: %s\n",
            frame_source == FRAME_SOURCE_VPSS ? "VPSS" : "VI");
+    printf("Video codec: %s\n",
+           video_codec == VIDEO_CODEC_H264 ? "H.264" : "H.265");
+    printf("Audio codec: %s\n",
+           audio_codec == AUDIO_CODEC_AAC ? "AAC" : "MP3");
     signal(SIGINT, signal_handler); signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 

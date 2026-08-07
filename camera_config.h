@@ -14,6 +14,8 @@ typedef struct {
     int rtsp_port;
     char rtsp_path[CAMERA_CONFIG_RTSP_PATH_MAX];
     char frame_source[8];
+    char video_codec[8];
+    char audio_codec[8];
     bool lvgl;
 } camera_config_t;
 

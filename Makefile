@@ -2,6 +2,7 @@ SDK_ROOT ?= ..
 TOOLCHAIN_BIN := $(SDK_ROOT)/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin
 CROSS := $(TOOLCHAIN_BIN)/arm-rockchip830-linux-uclibcgnueabihf-
 CC := $(CROSS)gcc
+CXX := $(CROSS)g++
 HOST_CC ?= gcc
 
 MEDIA := $(SDK_ROOT)/media
@@ -13,6 +14,15 @@ TARGETS := camera_capture camera_live
 UI_SRC := ui/camera_ui.c
 STREAM_SRC := media_callbacks.c
 CONFIG_SRC := camera_config.c
+AAC_SRC := aac_encoder.c
+AUDIO_ENCODER_SRC := audio_encoder.c
+LIVE555_SRC := live555_rtsp_server.cpp
+LIVE555_STAGING := $(SDK_ROOT)/sysdrv/source/buildroot/buildroot-2023.02.6/output/staging/usr
+LIVE555_LIB := $(LIVE555_STAGING)/lib
+CAMERA_LIVE_OBJS := camera_live.o ui/camera_ui.o media_callbacks.o camera_config.o \
+	aac_encoder.o live555_rtsp_server.o
+
+CAMERA_LIVE_OBJS += audio_encoder.o
 
 CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
 	-D_FILE_OFFSET_BITS=64 -march=armv7-a -mfpu=neon -mfloat-abi=hard \
@@ -25,9 +35,24 @@ CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
 	-I$(MEDIA_OUT)/include/rkaiq/iq_parser_v2 -I$(LVGL)/include \
 	-I$(LVGL)/include/lvgl -Iui
 
+CXXFLAGS := $(CFLAGS) -std=c++11 \
+	-I$(LIVE555_STAGING)/include/liveMedia \
+	-I$(LIVE555_STAGING)/include/groupsock \
+	-I$(LIVE555_STAGING)/include/BasicUsageEnvironment \
+	-I$(LIVE555_STAGING)/include/UsageEnvironment
+
+CFLAGS += -I$(LIVE555_STAGING)/include
+
 LDFLAGS := -L$(COMMON)/lib -lsample_comm -L$(MEDIA_OUT)/lib \
 	-Wl,-rpath-link,$(MEDIA_OUT)/lib:$(MEDIA_OUT)/root/usr/lib \
-	-lrkaiq -lrockit_full -lrkmuxer -lrtsp -lpthread
+	-lrkaiq -lrockit_full -lrkaudio -lrkmuxer -lpthread
+
+FFMPEG_LDFLAGS := -L$(LIVE555_LIB) -Wl,-rpath-link,$(LIVE555_LIB) \
+	-lavcodec -lavutil
+
+LIVE555_LDFLAGS := -L$(LIVE555_LIB) \
+	-Wl,-rpath-link,$(LIVE555_LIB) \
+	-lliveMedia -lgroupsock -lBasicUsageEnvironment -lUsageEnvironment
 
 LVGL_LDFLAGS := -L$(LVGL)/lib -llvgl -lm
 
@@ -37,16 +62,22 @@ all: check $(TARGETS)
 
 check:
 	@test -x $(CC) || (echo "Missing compiler: $(CC)"; exit 1)
+	@test -x $(CXX) || (echo "Missing C++ compiler: $(CXX)"; exit 1)
 	@test -f $(COMMON)/lib/libsample_comm.a || \
 		(echo "Build SDK samples first: cd $(MEDIA) && make samples"; exit 1)
 
 camera_capture: camera_capture.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-camera_live: camera_live.c $(UI_SRC) $(STREAM_SRC) $(CONFIG_SRC)
+camera_live: $(CAMERA_LIVE_OBJS)
 	@test -f $(LVGL)/lib/liblvgl.a || \
 		(echo "Build LVGL first: make -C project/app/component/lvgl RK_ENABLE_LVGL=y"; exit 1)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LVGL_LDFLAGS)
+	@test -f $(LIVE555_LIB)/libliveMedia.so || \
+		(echo "Build Live555 first: make -C $(SDK_ROOT)/sysdrv/source/buildroot/buildroot-2023.02.6 O=output live555"; exit 1)
+	@test -f $(LIVE555_LIB)/libavcodec.so || \
+		(echo "Missing FFmpeg libavcodec in Buildroot staging"; exit 1)
+	$(CXX) $^ -o $@ $(LDFLAGS) $(FFMPEG_LDFLAGS) $(LIVE555_LDFLAGS) \
+		$(LVGL_LDFLAGS)
 
 SIM_BUILD := build-sim
 SIM_LVGL := $(SIM_BUILD)/lvgl
@@ -69,4 +100,5 @@ simulator: simulator-lvgl sim/camera_simulator.c $(UI_SRC)
 
 clean:
 	rm -f $(TARGETS) camera_simulator
+	rm -f $(CAMERA_LIVE_OBJS)
 	rm -rf $(SIM_BUILD)

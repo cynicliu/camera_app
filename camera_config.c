@@ -46,6 +46,8 @@ void camera_config_defaults(camera_config_t *config) {
     config->rtsp_port = 554;
     snprintf(config->rtsp_path, sizeof(config->rtsp_path), "/live/0");
     snprintf(config->frame_source, sizeof(config->frame_source), "vi");
+    snprintf(config->video_codec, sizeof(config->video_codec), "h265");
+    snprintf(config->audio_codec, sizeof(config->audio_codec), "aac");
 }
 
 int camera_config_load(camera_config_t *config, const char *path) {
@@ -96,6 +98,16 @@ int camera_config_load(camera_config_t *config, const char *path) {
             if (strcmp(value, "vi") != 0 && strcmp(value, "vpss") != 0)
                 goto invalid_value;
             if (copy_value(config->frame_source, sizeof(config->frame_source), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "video_codec") == 0) {
+            if (strcmp(value, "h264") != 0 && strcmp(value, "h265") != 0)
+                goto invalid_value;
+            if (copy_value(config->video_codec, sizeof(config->video_codec), value,
+                           key, line_number)) goto invalid;
+        } else if (strcmp(key, "audio_codec") == 0) {
+            if (strcmp(value, "aac") != 0 && strcmp(value, "mp3") != 0)
+                goto invalid_value;
+            if (copy_value(config->audio_codec, sizeof(config->audio_codec), value,
                            key, line_number)) goto invalid;
         } else if (strcmp(key, "lvgl") == 0) {
             if (parse_bool(value, &config->lvgl)) goto invalid_value;

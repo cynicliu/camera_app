@@ -1,0 +1,5 @@
+camera_capture
+camera_live
+camera_simulator
+*.o
+build-sim/

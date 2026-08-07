@@ -29,6 +29,7 @@
 #include "camera_config.h"
 #include "camera_ui.h"
 #include "media_callbacks.h"
+#include "aenc_mp3.h"
 
 #define SCREEN_W 480
 #define SCREEN_H 480
@@ -39,7 +40,7 @@
 #define BAR_H 67
 #define UI_CHN 1
 #define AUDIO_RATE 16000
-#define AUDIO_SAMPLES 256
+#define AUDIO_SAMPLES 1152
 #define VIDEO_FPS 25
 #define VIDEO_BITRATE_KBPS 2048
 #define AUDIO_BITRATE 32000
@@ -52,6 +53,11 @@ typedef enum {
     FRAME_SOURCE_VPSS,
 } FRAME_SOURCE_E;
 
+typedef enum {
+    AUDIO_CODEC_AAC,
+    AUDIO_CODEC_MP3,
+} AUDIO_CODEC_E;
+
 typedef struct {
     SAMPLE_VI_CTX_S vi;
     SAMPLE_VPSS_CTX_S vpss;
@@ -60,6 +66,7 @@ typedef struct {
     SAMPLE_AO_CTX_S ao;
     SAMPLE_VENC_CTX_S venc;
     SAMPLE_AENC_CTX_S aenc;
+    camera_mp3_encoder_t *mp3_encoder;
     MPP_CHN_S vi_src;
     MPP_CHN_S vpss_dst;
     MPP_CHN_S vpss_src;
@@ -76,6 +83,7 @@ typedef struct {
     rtsp_session_handle rtsp_session;
     bool running;
     bool audio_enabled;
+    AUDIO_CODEC_E audio_codec;
     bool lvgl_preview;
     FRAME_SOURCE_E frame_source;
     bool quit;
@@ -346,12 +354,13 @@ static void *audio_loop(void *opaque) {
     APP_CTX *app = opaque;
     while (!app->quit && !g_signal_stop) {
         AUDIO_FRAME_S frame;
-        bool play, stream;
+        bool play, stream, software_mp3;
         RK_S32 ret = RK_MPI_AI_GetFrame(0, 0, &frame, NULL, 200);
         if (ret != RK_SUCCESS) continue;
         pthread_mutex_lock(&app->lock);
         play = app->running && app->audio_enabled;
         stream = app->running && app->muxer_ready;
+        software_mp3 = app->mp3_encoder != NULL;
         pthread_mutex_unlock(&app->lock);
         if (play) {
             frame.bBypassMbBlk = RK_FALSE;
@@ -359,11 +368,27 @@ static void *audio_loop(void *opaque) {
             if (ret != RK_SUCCESS)
                 fprintf(stderr, "audio output dropped: %#x\n", ret);
         }
-        if (stream) {
+        if (stream && software_mp3) {
+            RK_U8 output[2048];
+            RK_U32 output_size = 0;
+            RK_S32 muxer_ret;
+            RK_U8 *input = RK_MPI_MB_Handle2VirAddr(frame.pMbBlk);
+
+            if (camera_mp3_encoder_encode(app->mp3_encoder, input, frame.u32Len,
+                                          output, sizeof(output), &output_size)
+                == RK_SUCCESS && output_size > 0) {
+                pthread_mutex_lock(&app->muxer_lock);
+                muxer_ret = rkmuxer_write_audio_frame(MUXER_ID, output,
+                                                      output_size, frame.u64TimeStamp);
+                pthread_mutex_unlock(&app->muxer_lock);
+                if (muxer_ret != 0)
+                    fprintf(stderr, "RTMP MP3 audio write failed: %d\n", muxer_ret);
+            }
+        } else if (stream && app->aenc_ready) {
             frame.bBypassMbBlk = RK_FALSE;
             ret = RK_MPI_AENC_SendFrame(app->aenc.s32ChnId, &frame, NULL, 200);
             if (ret != RK_SUCCESS)
-                fprintf(stderr, "AAC input dropped: %#x\n", ret);
+                fprintf(stderr, "encoded audio input dropped: %#x\n", ret);
         }
         RK_MPI_AI_ReleaseFrame(0, 0, &frame, NULL);
     }
@@ -402,19 +427,70 @@ static void streaming_video_callback(const VENC_STREAM_S *stream, void *userdata
 
 static void rtmp_audio_callback(const AUDIO_STREAM_S *stream, void *userdata) {
     APP_CTX *app = userdata;
-    const unsigned int adts_header_size = 7;
+    unsigned int header_size;
     RK_S32 ret;
     pthread_mutex_lock(&app->lock);
     bool write_frame = app->running && app->muxer_ready;
     pthread_mutex_unlock(&app->lock);
-    if (!write_frame || stream->u32Len <= adts_header_size) return;
+    header_size = app->audio_codec == AUDIO_CODEC_AAC ? 7 : 0;
+    if (!write_frame || stream->u32Len <= header_size) return;
     unsigned char *data = RK_MPI_MB_Handle2VirAddr(stream->pMbBlk);
     pthread_mutex_lock(&app->muxer_lock);
-    ret = rkmuxer_write_audio_frame(MUXER_ID, data + adts_header_size,
-                                     stream->u32Len - adts_header_size,
+    ret = rkmuxer_write_audio_frame(MUXER_ID, data + header_size,
+                                     stream->u32Len - header_size,
                                      stream->u64TimeStamp);
     pthread_mutex_unlock(&app->muxer_lock);
     if (ret != 0) fprintf(stderr, "RTMP audio write failed: %d\n", ret);
+}
+
+static const char *audio_codec_name(AUDIO_CODEC_E codec) {
+    return codec == AUDIO_CODEC_AAC ? "AAC" : "MP3";
+}
+
+static RK_S32 create_audio_encoder(APP_CTX *app) {
+    const AUDIO_CODEC_E codecs[] = {AUDIO_CODEC_AAC, AUDIO_CODEC_MP3};
+    size_t i;
+
+    for (i = 0; i < sizeof(codecs) / sizeof(codecs[0]); ++i) {
+        AUDIO_CODEC_E codec = codecs[i];
+
+        if (codec == AUDIO_CODEC_MP3) {
+            app->mp3_encoder = camera_mp3_encoder_open(AUDIO_RATE, 1, 32000);
+            if (!app->mp3_encoder) {
+                fprintf(stderr, "MP3 software encoder initialization failed\n");
+                continue;
+            }
+            app->audio_codec = AUDIO_CODEC_MP3;
+            printf("Audio encoder: MP3 %d Hz mono (software)\n", AUDIO_RATE);
+            return RK_SUCCESS;
+        }
+
+        memset(&app->aenc, 0, sizeof(app->aenc));
+        app->aenc.s32ChnId = 0;
+        app->aenc.stChnAttr.enType = codec == AUDIO_CODEC_AAC
+            ? RK_AUDIO_ID_ACC : RK_AUDIO_ID_MP3;
+        app->aenc.stChnAttr.u32BufCount = 4;
+        app->aenc.stChnAttr.u32Depth = 4;
+        app->aenc.stChnAttr.stCodecAttr.enType = codec == AUDIO_CODEC_AAC
+            ? RK_AUDIO_ID_ACC : RK_AUDIO_ID_MP3;
+        app->aenc.stChnAttr.stCodecAttr.u32Channels = 1;
+        app->aenc.stChnAttr.stCodecAttr.u32SampleRate = AUDIO_RATE;
+        app->aenc.stChnAttr.stCodecAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
+        if (codec == AUDIO_CODEC_AAC) {
+            app->aenc.stChnAttr.stCodecAttr.u32Resv[0] = 2;
+            app->aenc.stChnAttr.stCodecAttr.u32Resv[1] = AUDIO_BITRATE;
+        }
+        if (SAMPLE_COMM_AENC_CreateChn(&app->aenc) == RK_SUCCESS) {
+            app->audio_codec = codec;
+            app->aenc_ready = true;
+            printf("Audio encoder: %s %d Hz mono\n", audio_codec_name(codec),
+                   AUDIO_RATE);
+            return RK_SUCCESS;
+        }
+        fprintf(stderr, "%s encoder unavailable; trying fallback\n",
+                audio_codec_name(codec));
+    }
+    return RK_FAILURE;
 }
 
 static RK_S32 init_audio(APP_CTX *app) {
@@ -475,18 +551,7 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
     if (SAMPLE_COMM_VENC_CreateChn(&app->venc) != RK_SUCCESS) return RK_FAILURE;
     app->venc_ready = true;
 
-    memset(&app->aenc, 0, sizeof(app->aenc));
-    app->aenc.s32ChnId = 0;
-    app->aenc.stChnAttr.enType = RK_AUDIO_ID_ACC;
-    app->aenc.stChnAttr.u32BufCount = 4;
-    app->aenc.stChnAttr.stCodecAttr.enType = RK_AUDIO_ID_ACC;
-    app->aenc.stChnAttr.stCodecAttr.u32Channels = 1;
-    app->aenc.stChnAttr.stCodecAttr.u32SampleRate = AUDIO_RATE;
-    app->aenc.stChnAttr.stCodecAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
-    app->aenc.stChnAttr.stCodecAttr.u32Resv[0] = 2;
-    app->aenc.stChnAttr.stCodecAttr.u32Resv[1] = AUDIO_BITRATE;
-    if (SAMPLE_COMM_AENC_CreateChn(&app->aenc) != RK_SUCCESS) return RK_FAILURE;
-    app->aenc_ready = true;
+    if (create_audio_encoder(app) != RK_SUCCESS) return RK_FAILURE;
 
     app->venc_src = app->frame_source == FRAME_SOURCE_VPSS
         ? app->vpss_stream_src : app->vi_src;
@@ -505,7 +570,8 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
         video.frame_rate_num = VIDEO_FPS; video.frame_rate_den = 1;
         memset(&audio, 0, sizeof(audio));
         snprintf(audio.format, sizeof(audio.format), "S16");
-        snprintf(audio.codec, sizeof(audio.codec), "ACC");
+        snprintf(audio.codec, sizeof(audio.codec), "%s",
+                 app->audio_codec == AUDIO_CODEC_AAC ? "ACC" : "MP3");
         audio.channels = 1; audio.sample_rate = AUDIO_RATE;
         audio.frame_size = AUDIO_SAMPLES;
         if (rkmuxer_init(MUXER_ID, "flv", config->rtmp_url, &video, &audio) != 0)
@@ -525,13 +591,16 @@ static RK_S32 init_streaming(APP_CTX *app, const camera_config_t *config) {
         app->rtsp_ready = true;
     }
     if (media_callbacks_start(&app->stream_callbacks, app->venc.s32ChnId,
-                              app->aenc.s32ChnId, streaming_video_callback,
-                              rtmp_audio_callback, app) != 0)
+                              app->aenc_ready ? app->aenc.s32ChnId : -1,
+                              streaming_video_callback,
+                              app->aenc_ready ? rtmp_audio_callback : NULL,
+                              app) != 0)
         return RK_FAILURE;
     app->stream_callbacks_ready = true;
     if (rtmp_enabled)
-        printf("RTMP publishing: %s (H.265 1920x1080@%d, AAC %d Hz mono)\n",
-               config->rtmp_url, VIDEO_FPS, AUDIO_RATE);
+        printf("RTMP publishing: %s (H.265 1920x1080@%d, %s %d Hz mono)\n",
+               config->rtmp_url, VIDEO_FPS, audio_codec_name(app->audio_codec),
+               AUDIO_RATE);
     if (config->rtsp_enabled)
         printf("RTSP serving: rtsp://0.0.0.0:%d%s (H.265 1920x1080@%d)\n",
                config->rtsp_port, config->rtsp_path, VIDEO_FPS);
@@ -743,6 +812,7 @@ static void cleanup(APP_CTX *app) {
     if (app->rtsp_demo) rtsp_del_demo(app->rtsp_demo);
     if (app->venc_bound) SAMPLE_COMM_UnBind(&app->venc_src, &app->venc_dst);
     if (app->aenc_ready) SAMPLE_COMM_AENC_DestroyChn(&app->aenc);
+    if (app->mp3_encoder) camera_mp3_encoder_close(app->mp3_encoder);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
     if (app->video_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
     if (app->vpss_ready) SAMPLE_COMM_UnBind(&app->vi_src, &app->vpss_dst);

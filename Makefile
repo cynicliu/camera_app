@@ -11,7 +11,7 @@ COMMON := $(SAMPLE)/common
 LVGL := $(SDK_ROOT)/project/app/component/lvgl/out
 TARGETS := camera_capture camera_live
 UI_SRC := ui/camera_ui.c
-STREAM_SRC := media_callbacks.c
+STREAM_SRC := media_callbacks.c aenc_mp3.c
 CONFIG_SRC := camera_config.c
 
 CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
@@ -23,11 +23,12 @@ CFLAGS := -Os -g -Wall -Wextra -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE \
 	-I$(MEDIA_OUT)/include/rkaiq/common -I$(MEDIA_OUT)/include/rkaiq/xcore \
 	-I$(MEDIA_OUT)/include/rkaiq/algos -I$(MEDIA_OUT)/include/rkaiq/iq_parser \
 	-I$(MEDIA_OUT)/include/rkaiq/iq_parser_v2 -I$(LVGL)/include \
-	-I$(LVGL)/include/lvgl -Iui
+	-I$(LVGL)/include/lvgl -I$(SDK_ROOT)/media/common_algorithm/out/include -Iui
 
 LDFLAGS := -L$(COMMON)/lib -lsample_comm -L$(MEDIA_OUT)/lib \
 	-Wl,-rpath-link,$(MEDIA_OUT)/lib:$(MEDIA_OUT)/root/usr/lib \
-	-lrkaiq -lrockit_full -lrkmuxer -lrtsp -lpthread
+	-lrkaiq -lrockit_full -lrkmuxer -lrtsp -lpthread \
+	-L$(SDK_ROOT)/media/common_algorithm/out/lib -lrkaudio
 
 LVGL_LDFLAGS := -L$(LVGL)/lib -llvgl -lm
 

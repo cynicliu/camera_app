@@ -47,6 +47,8 @@ int media_callbacks_start(media_callbacks_t *ctx, VENC_CHN venc_chn,
     if (pthread_create(&ctx->venc_thread, NULL, dispatch_venc, ctx) != 0)
         return -1;
     ctx->venc_started = true;
+    if (aenc_chn < 0 || !aenc_callback)
+        return 0;
     if (pthread_create(&ctx->aenc_thread, NULL, dispatch_aenc, ctx) != 0) {
         ctx->stop = true;
         pthread_join(ctx->venc_thread, NULL);

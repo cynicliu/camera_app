@@ -37,7 +37,6 @@
 #define VIDEO_Y 71
 #define BAR_Y 413
 #define BAR_H 67
-#define UI_CHN 1
 #define AUDIO_RATE 16000
 #define AUDIO_SAMPLES 256
 #define VIDEO_FPS 25
@@ -65,15 +64,12 @@ typedef enum {
 typedef struct {
     SAMPLE_VI_CTX_S vi;
     SAMPLE_VPSS_CTX_S vpss;
-    SAMPLE_VO_CTX_S vo;
     SAMPLE_AI_CTX_S ai;
     SAMPLE_AO_CTX_S ao;
     SAMPLE_VENC_CTX_S venc;
     MPP_CHN_S vi_src;
     MPP_CHN_S vpss_dst;
-    MPP_CHN_S vpss_src;
     MPP_CHN_S vpss_stream_src;
-    MPP_CHN_S vo_dst;
     MPP_CHN_S venc_src;
     MPP_CHN_S venc_dst;
     pthread_t audio_thread;
@@ -94,8 +90,6 @@ typedef struct {
     bool mpi_ready;
     bool vi_ready;
     bool vpss_ready;
-    bool vo_ready;
-    bool ui_ready;
     bool ai_ready;
     bool ao_ready;
     bool audio_thread_ready;
@@ -105,14 +99,10 @@ typedef struct {
     bool muxer_ready;
     bool rtsp_ready;
     bool stream_callbacks_ready;
-    bool video_bound;
-    MB_BLK ui_mb;
-    VIDEO_FRAME_INFO_S ui_frame;
     camera_ui_t ui;
 } APP_CTX;
 
 static volatile sig_atomic_t g_signal_stop;
-static APP_CTX *g_app;
 static int g_touch_fd = -1;
 static int g_touch_x;
 static int g_touch_y;
@@ -308,28 +298,6 @@ static void *framebuffer_preview_loop(void *opaque) {
     return NULL;
 }
 
-static void lvgl_flush(lv_disp_drv_t *drv, const lv_area_t *area,
-                       lv_color_t *colors) {
-    uint8_t *rgb = RK_MPI_MB_Handle2VirAddr(g_app->ui_mb);
-    int x, y;
-    (void)drv;
-    for (y = area->y1; y <= area->y2; ++y) {
-        for (x = area->x1; x <= area->x2; ++x) {
-            lv_color_t c = *colors++;
-            uint8_t *p = rgb + ((size_t)y * SCREEN_W + x) * 3;
-            p[0] = (uint8_t)(c.ch.red * 255 / 31);
-            p[1] = (uint8_t)(c.ch.green * 255 / 63);
-            p[2] = (uint8_t)(c.ch.blue * 255 / 31);
-        }
-    }
-    if (lv_disp_flush_is_last(drv)) {
-        RK_MPI_SYS_MmzFlushCache(g_app->ui_mb, RK_FALSE);
-        RK_MPI_VO_SendFrame(g_app->vo.s32LayerId, UI_CHN,
-                            &g_app->ui_frame, 1000);
-    }
-    lv_disp_flush_ready(drv);
-}
-
 static void lvgl_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     (void)drv;
     data->point.x = g_touch_x * (SCREEN_W - 1) / g_touch_max_x;
@@ -337,19 +305,6 @@ static void lvgl_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     if (data->point.y < 0) data->point.y = 0;
     if (data->point.y >= BAR_H) data->point.y = BAR_H - 1;
     data->state = g_touch_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-}
-
-static RK_S32 set_video_visible(APP_CTX *app, bool visible) {
-    RK_S32 ret = RK_SUCCESS;
-    return RK_SUCCESS;
-    if (visible && !app->video_bound) {
-        ret = SAMPLE_COMM_Bind(&app->vpss_src, &app->vo_dst);
-        if (ret == RK_SUCCESS) app->video_bound = true;
-    } else if (!visible && app->video_bound) {
-        ret = SAMPLE_COMM_UnBind(&app->vpss_src, &app->vo_dst);
-        if (ret == RK_SUCCESS) app->video_bound = false;
-    }
-    return ret;
 }
 
 static void *audio_loop(void *opaque) {
@@ -614,7 +569,6 @@ static RK_S32 init_video(APP_CTX *app) {
     if (SAMPLE_COMM_VPSS_CreateChn(&app->vpss) != RK_SUCCESS) return RK_FAILURE;
     app->vpss_ready = true;
     app->vpss_dst = (MPP_CHN_S){RK_ID_VPSS, 0, 0};
-    app->vpss_src = (MPP_CHN_S){RK_ID_VPSS, 0, VPSS_PREVIEW_CHN};
     app->vpss_stream_src = (MPP_CHN_S){RK_ID_VPSS, 0, VPSS_STREAM_CHN};
     if (SAMPLE_COMM_Bind(&app->vi_src, &app->vpss_dst) != RK_SUCCESS)
         return RK_FAILURE;
@@ -656,7 +610,6 @@ static void toggle_play(APP_CTX *app) {
     app->running = !app->running;
     next = app->running;
     pthread_mutex_unlock(&app->lock);
-    set_video_visible(app, next);
     if (next && app->venc_ready)
         RK_MPI_VENC_RequestIDR(app->venc.s32ChnId, RK_TRUE);
     camera_ui_set_running(&app->ui, next);
@@ -676,7 +629,6 @@ static void ui_set_running(void *userdata, bool running) {
     pthread_mutex_lock(&app->lock);
     app->running = running;
     pthread_mutex_unlock(&app->lock);
-    set_video_visible(app, running);
     if (running && app->venc_ready)
         RK_MPI_VENC_RequestIDR(app->venc.s32ChnId, RK_TRUE);
 }
@@ -699,7 +651,6 @@ static void init_lvgl(APP_CTX *app) {
         ui_set_running, ui_set_audio_enabled, ui_request_exit, app
     };
 
-    g_app = app;
     lv_init();
     lv_disp_draw_buf_init(&g_lv_draw_buf, g_lv_pixels, NULL,
                           sizeof(g_lv_pixels) / sizeof(g_lv_pixels[0]));
@@ -777,11 +728,7 @@ static void cleanup(APP_CTX *app) {
     if (app->rtsp_server) live555_rtsp_server_stop(app->rtsp_server);
     if (app->venc_bound) SAMPLE_COMM_UnBind(&app->venc_src, &app->venc_dst);
     if (app->venc_ready) SAMPLE_COMM_VENC_DestroyChn(&app->venc);
-    if (app->video_bound) SAMPLE_COMM_UnBind(&app->vi_src, &app->vo_dst);
     if (app->vpss_ready) SAMPLE_COMM_UnBind(&app->vi_src, &app->vpss_dst);
-    if (app->ui_mb) RK_MPI_MB_ReleaseMB(app->ui_mb);
-    if (app->ui_ready) RK_MPI_VO_DisableChn(0, UI_CHN);
-    if (app->vo_ready) SAMPLE_COMM_VO_DestroyChn(&app->vo);
     if (app->vpss_ready) SAMPLE_COMM_VPSS_DestroyChn(&app->vpss);
     if (app->vi_ready) SAMPLE_COMM_VI_DestroyChn(&app->vi);
     if (app->ao_ready) SAMPLE_COMM_AO_DestroyChn(&app->ao);
